@@ -1,9 +1,7 @@
 import { Prisma } from '@prisma/client';
 
-import { createUserToken, generatePairCode, hashPassword, verifyPassword } from '@/lib/crypto';
+import { createUserToken, hashPassword, verifyPassword } from '@/lib/crypto';
 import { prisma } from '@/lib/prisma';
-
-const PAIR_SESSION_TTL_MS = 5 * 60 * 1000;
 
 type SafeUser = {
   id: string;
@@ -127,116 +125,6 @@ export async function registerDevice(input: { hardwareId: string; deviceSecret: 
   return {
     device: sanitizeDevice(device),
     updated: false,
-  };
-}
-
-export async function createPairSession(userId: string, input: { hardwareId: string }) {
-  const hardwareId = input.hardwareId.trim();
-  if (!hardwareId) {
-    return { error: 'hardwareId is required' as const };
-  }
-
-  const device = await prisma.device.findUnique({ where: { hardwareId } });
-  if (!device) {
-    return { error: 'Unknown hardwareId. Register device first.' as const };
-  }
-
-  if (device.lockedByUserId && device.lockedByUserId !== userId) {
-    return { error: 'Device is locked by another user. Physical reset required.' as const };
-  }
-
-  const nowMs = Date.now();
-  const expiresAt = new Date(nowMs + PAIR_SESSION_TTL_MS);
-
-  const pairSession = await prisma.pairSession.create({
-    data: {
-      code: generatePairCode(),
-      userId,
-      deviceId: device.id,
-      expiresAt,
-    },
-  });
-
-  return {
-    pairSession: {
-      id: pairSession.id,
-      code: pairSession.code,
-      expiresAt: pairSession.expiresAt.toISOString(),
-      qrPayload: JSON.stringify({
-        t: 'PAIR',
-        code: pairSession.code,
-        hardwareId,
-      }),
-    },
-  };
-}
-
-export async function confirmPairing(input: {
-  hardwareId: string;
-  deviceSecret: string;
-  pairCode: string;
-}) {
-  const hardwareId = input.hardwareId.trim();
-  const pairCode = input.pairCode.trim().toUpperCase();
-  const deviceSecret = input.deviceSecret.trim();
-
-  if (!hardwareId || !pairCode || !deviceSecret) {
-    return { error: 'hardwareId, deviceSecret and pairCode are required' as const };
-  }
-
-  const device = await prisma.device.findUnique({ where: { hardwareId } });
-  if (!device) {
-    return { error: 'Unknown hardwareId' as const };
-  }
-
-  if (device.deviceSecret !== deviceSecret) {
-    return { error: 'Invalid device credentials' as const };
-  }
-
-  const session = await prisma.pairSession.findUnique({
-    where: { code: pairCode },
-  });
-
-  if (!session) {
-    return { error: 'Invalid pair code' as const };
-  }
-
-  if (session.deviceId !== device.id) {
-    return { error: 'Pair code does not belong to this device' as const };
-  }
-
-  if (session.consumed) {
-    return { error: 'Pair code already used' as const };
-  }
-
-  if (Date.now() > session.expiresAt.getTime()) {
-    return { error: 'Pair code expired' as const };
-  }
-
-  if (device.lockedByUserId && device.lockedByUserId !== session.userId) {
-    return { error: 'Device locked by another user. Physical reset required.' as const };
-  }
-
-  const updatedDevice = await prisma.$transaction(async (tx) => {
-    await tx.pairSession.update({
-      where: { id: session.id },
-      data: { consumed: true },
-    });
-
-    return tx.device.update({
-      where: { id: device.id },
-      data: {
-        ownerUserId: session.userId,
-        lockedByUserId: session.userId,
-        pairedAt: new Date(),
-      },
-    });
-  });
-
-  return {
-    paired: true,
-    device: sanitizeDevice(updatedDevice),
-    userId: session.userId,
   };
 }
 

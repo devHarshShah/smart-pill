@@ -7,8 +7,9 @@
 #define BUZZER_PIN             18
 #define LED_PIN                19
 
-#define PILL_CHANGE_THRESHOLD  0.6
-#define CONFIRM_READS          8
+#define PILL_CHANGE_THRESHOLD  0.3
+#define CONFIRM_READS          5
+#define CAL_ROUNDS             7
 
 // ----- Wi-Fi + backend config -----
 const char* WIFI_SSID = "SarvehS22";
@@ -19,7 +20,7 @@ const char* DEVICE_SECRET = "esp32-secret-001";
 
 const unsigned long POLL_INTERVAL_MS = 4000;
 const unsigned long STATUS_INTERVAL_MS = 10000;
-const unsigned long MONITOR_WARMUP_MS = 8000;
+const unsigned long MONITOR_WARMUP_MS = 1500;
 
 unsigned long lastPollMs = 0;
 unsigned long lastStatusMs = 0;
@@ -121,31 +122,34 @@ void registerDeviceWithServer() {
 }
 
 float getFastWeight() {
-  return abs(scale.get_units(10));
+  float s[5];
+  for (int i = 0; i < 5; i++) {
+    float w = scale.get_units(5);
+    s[i] = w < 0 ? -w : w;
+    if (i < 4) delay(10);
+  }
+  // insertion sort (5 elements)
+  for (int i = 1; i < 5; i++) {
+    float key = s[i];
+    int j = i - 1;
+    while (j >= 0 && s[j] > key) { s[j+1] = s[j]; j--; }
+    s[j+1] = key;
+  }
+  return s[2];  // median
 }
 
 int getFastPillCount() {
   if (!setupDone || pillWeight <= 0.0001f) return currentPills;
 
   float weight = getFastWeight();
-  int count = (int)((weight + pillWeight * (1.0 - PILL_CHANGE_THRESHOLD)) / pillWeight);
+  Serial.print("[DBG] weight="); Serial.print(weight, 2);
+  Serial.print(" pillWeight="); Serial.println(pillWeight, 3);
+  int count = (int)(weight / pillWeight + 0.5f);
   if (count < 0) count = 0;
   if (count > totalPills) count = totalPills;
   return count;
 }
 
-float getStableWeight(int samples) {
-  return abs(scale.get_units(20));
-}
-
-int getStablePillCount() {
-  if (!setupDone || pillWeight <= 0.0001f) return currentPills;
-  float weight = getStableWeight(10);
-  int count = (int)((weight + pillWeight * (1.0 - PILL_CHANGE_THRESHOLD)) / pillWeight);
-  if (count < 0) count = 0;
-  if (count > totalPills) count = totalPills;
-  return count;
-}
 
 float extractFloat(String text, String key, float fallback) {
   String token = "\"" + key + "\":";
@@ -183,12 +187,33 @@ bool extractBool(String text, String key, bool fallback) {
 
 void calibrateOnePillAsUnit() {
   Serial.println("[CAL] CALIBRATE_ONE_PILL started. Keep exactly one pill on scale.");
-  long rawOnePill = scale.get_value(20);
-  if (rawOnePill < 0) rawOnePill = -rawOnePill;
 
-  if (rawOnePill < 50) {
-    Serial.print("[CAL] failed, rawOnePill too small: ");
-    Serial.println(rawOnePill);
+  const int ROUNDS = CAL_ROUNDS;
+  long samples[CAL_ROUNDS];
+  for (int i = 0; i < ROUNDS; i++) {
+    long raw = scale.get_value(30);
+    samples[i] = raw < 0 ? -raw : raw;
+    Serial.print("[CAL] round "); Serial.print(i+1);
+    Serial.print(" raw="); Serial.println(samples[i]);
+    if (i < ROUNDS - 1) delay(300);
+  }
+
+  // insertion sort
+  for (int i = 1; i < ROUNDS; i++) {
+    long key = samples[i]; int j = i - 1;
+    while (j >= 0 && samples[j] > key) { samples[j+1] = samples[j]; j--; }
+    samples[j+1] = key;
+  }
+
+  // reject lowest and highest, average the middle 5
+  long sum = 0;
+  for (int i = 1; i < ROUNDS - 1; i++) sum += samples[i];
+  long rawOnePill = sum / (ROUNDS - 2);
+
+  Serial.print("[CAL] median-trimmed raw="); Serial.println(rawOnePill);
+
+  if (rawOnePill < 200) {
+    Serial.print("[CAL] failed, raw too small: "); Serial.println(rawOnePill);
     return;
   }
 
@@ -196,19 +221,36 @@ void calibrateOnePillAsUnit() {
   scale.set_scale(calibrationFactor);
   pillWeight = 1.0f;
   pillUnitMode = true;
-  if (totalPills > 0 && currentPills <= 0) {
-    currentPills = totalPills;
-  }
+  if (totalPills > 0 && currentPills <= 0) currentPills = totalPills;
   pendingCount = currentPills;
   setupDone = totalPills > 0;
 
-  Serial.print("[CAL] success. factor=");
-  Serial.print(calibrationFactor, 3);
-  Serial.print(" | pillWeight=");
-  Serial.print(pillWeight, 3);
-  Serial.print(" | setupDone=");
-  Serial.println(setupDone ? "true" : "false");
+  Serial.print("[CAL] success. factor="); Serial.print(calibrationFactor, 3);
+  Serial.print(" | pillWeight="); Serial.print(pillWeight, 3);
+  Serial.print(" | setupDone="); Serial.println(setupDone ? "true" : "false");
   beep(2);
+}
+
+int getStablePillCount() {
+  const int VROUNDS = 5;
+  int counts[VROUNDS];
+  for (int i = 0; i < VROUNDS; i++) {
+    counts[i] = getFastPillCount();
+    Serial.print("[VFY] round "); Serial.print(i+1);
+    Serial.print(" count="); Serial.println(counts[i]);
+    if (i < VROUNDS - 1) delay(200);
+  }
+  // insertion sort
+  for (int i = 1; i < VROUNDS; i++) {
+    int key = counts[i]; int j = i - 1;
+    while (j >= 0 && counts[j] > key) { counts[j+1] = counts[j]; j--; }
+    counts[j+1] = key;
+  }
+  // check all readings agree (no spread > 1)
+  if (counts[VROUNDS-1] - counts[0] > 1) {
+    Serial.println("[VFY] unstable readings, using median");
+  }
+  return counts[VROUNDS / 2]; // median
 }
 
 void applySetupFromPayload(String json) {
@@ -231,8 +273,18 @@ void applySetupFromPayload(String json) {
   setupDone = true;
   setupAppliedAtMs = millis();
 
-  detectedPills = currentPills;  // telemetry only, no override
-  setupMismatch = false;
+  delay(500);  // let scale settle after config
+  detectedPills = getStablePillCount();
+  setupMismatch = (detectedPills != currentPills);
+
+  if (setupMismatch) {
+    Serial.print("[SETUP] MISMATCH detected=");
+    Serial.print(detectedPills);
+    Serial.print(" expected=");
+    Serial.println(currentPills);
+  } else {
+    Serial.println("[SETUP] count verified OK");
+  }
 
   Serial.print("[SETUP] applied pillWeight=");
   Serial.print(pillWeight, 3);
@@ -345,7 +397,8 @@ void monitorPills() {
       confirmStreak = 1;
     }
 
-    if (confirmStreak >= CONFIRM_READS) {
+    int requiredReads = (abs(newCount - currentPills) > 2) ? CONFIRM_READS * 2 : CONFIRM_READS;
+    if (confirmStreak >= requiredReads) {
       if (newCount < currentPills) {
         int taken = currentPills - newCount;
         Serial.print("[PILL] removed=");
@@ -395,7 +448,6 @@ void setup() {
     pushRuntimeStatus();
   }
 
-  setupAppliedAtMs = millis();  // enforce warmup on boot
 }
 
 void loop() {
