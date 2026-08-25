@@ -47,6 +47,59 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+body {
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+}
+
+.card {
+  border: 1px solid rgb(71 85 105 / 0.55);
+  background: linear-gradient(165deg, rgb(15 23 42 / 0.9), rgb(2 6 23 / 0.9));
+  border-radius: 1rem;
+  padding: 1rem;
+}
+
+.card-title {
+  font-size: 0.95rem;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+  font-weight: 600;
+  color: rgb(125 211 252);
+  margin-bottom: 0.65rem;
+}
+
+.field {
+  width: 100%;
+  border: 1px solid rgb(51 65 85);
+  border-radius: 0.8rem;
+  background: rgb(15 23 42 / 0.75);
+  color: rgb(226 232 240);
+  padding: 0.62rem 0.72rem;
+  margin-bottom: 0.62rem;
+}
+
+.field:focus {
+  outline: none;
+  border-color: rgb(34 211 238);
+  box-shadow: 0 0 0 3px rgb(34 211 238 / 0.18);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(34 211 238 / 0.45);
+  border-radius: 9999px;
+  background: linear-gradient(90deg, rgb(6 182 212 / 0.9), rgb(20 184 166 / 0.9));
+  color: rgb(8 47 73);
+  font-weight: 700;
+  font-size: 0.9rem;
+  padding: 0.55rem 0.95rem;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+}
+
 :root {
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
