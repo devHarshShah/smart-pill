@@ -1,0 +1,104 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String          @id @default(uuid())
+  email        String          @unique
+  name         String?
+  passwordHash String
+  createdAt    DateTime        @default(now())
+
+  ownedDevices Device[]        @relation("DeviceOwner")
+  lockedDevices Device[]       @relation("DeviceLockOwner")
+  pairSessions PairSession[]
+  commands     DeviceCommand[]
+}
+
+model Device {
+  id                  String               @id @default(uuid())
+  hardwareId          String               @unique
+  deviceSecret        String
+  label               String?
+  ownerUserId         String?
+  lockedByUserId      String?
+  pairedAt            DateTime?
+  lastPhysicalResetAt DateTime?
+  createdAt           DateTime             @default(now())
+
+  owner         User?                @relation("DeviceOwner", fields: [ownerUserId], references: [id])
+  lockOwner     User?                @relation("DeviceLockOwner", fields: [lockedByUserId], references: [id])
+  pairSessions  PairSession[]
+  commands      DeviceCommand[]
+  events        DeviceEvent[]
+  runtimeStatus DeviceRuntimeStatus?
+}
+
+model PairSession {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  userId    String
+  deviceId  String
+  expiresAt DateTime
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id])
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId])
+  @@index([userId])
+}
+
+model DeviceCommand {
+  id        String   @id @default(uuid())
+  deviceId  String
+  userId    String
+  command   String
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id])
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@index([deviceId, createdAt])
+  @@index([userId])
+}
+
+model DeviceRuntimeStatus {
+  id            String   @id @default(uuid())
+  deviceId      String   @unique
+  hardwareId    String
+  wifiConnected Boolean
+  ip            String?
+  rssi          Int?
+  setupDone     Boolean
+  setupMismatch Boolean  @default(false)
+  detectedPills Int?
+  pillWeight    Float?
+  threshold     Float?
+  confirmReads  Int?
+  currentPills  Int?
+  totalPills    Int?
+  updatedAt     DateTime @updatedAt
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([hardwareId])
+}
+
+model DeviceEvent {
+  id        String   @id @default(uuid())
+  deviceId  String
+  type      String
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, createdAt])
+}
