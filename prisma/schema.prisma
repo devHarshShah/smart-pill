@@ -15,7 +15,6 @@ model User {
 
   ownedDevices Device[]        @relation("DeviceOwner")
   lockedDevices Device[]       @relation("DeviceLockOwner")
-  pairSessions PairSession[]
   commands     DeviceCommand[]
 }
 
@@ -32,26 +31,9 @@ model Device {
 
   owner         User?                @relation("DeviceOwner", fields: [ownerUserId], references: [id])
   lockOwner     User?                @relation("DeviceLockOwner", fields: [lockedByUserId], references: [id])
-  pairSessions  PairSession[]
   commands      DeviceCommand[]
   events        DeviceEvent[]
   runtimeStatus DeviceRuntimeStatus?
-}
-
-model PairSession {
-  id        String   @id @default(uuid())
-  code      String   @unique
-  userId    String
-  deviceId  String
-  expiresAt DateTime
-  consumed  Boolean  @default(false)
-  createdAt DateTime @default(now())
-
-  user   User   @relation(fields: [userId], references: [id])
-  device Device @relation(fields: [deviceId], references: [id])
-
-  @@index([deviceId])
-  @@index([userId])
 }
 
 model DeviceCommand {
