@@ -30,7 +30,21 @@ type DeviceItem = {
   label?: string;
   pairedAt?: string;
   status?: DeviceStatus;
+  upcomingDoses?: Array<{
+    id: string;
+    pillName: string;
+    scheduledAt: string;
+    requiredPills: number;
+    alertTriggeredAt?: string | null;
+  }>;
 };
+
+function defaultDoseTimeInputValue() {
+  const target = new Date(Date.now() + 60 * 60 * 1000);
+  target.setSeconds(0, 0);
+  const tzOffset = target.getTimezoneOffset() * 60 * 1000;
+  return new Date(target.getTime() - tzOffset).toISOString().slice(0, 16);
+}
 
 async function apiFetch<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
@@ -74,6 +88,9 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
   const [expanded, setExpanded] = useState(false);
   const [totalPills, setTotalPills] = useState('15');
   const [currentPills, setCurrentPills] = useState('15');
+  const [pillName, setPillName] = useState('');
+  const [scheduledAt, setScheduledAt] = useState(defaultDoseTimeInputValue());
+  const [requiredPills, setRequiredPills] = useState('1');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
 
@@ -104,6 +121,44 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
       currentPills: Number(currentPills),
     });
     onRefresh();
+  }
+
+  async function saveDoseSchedule() {
+    if (!pillName.trim()) {
+      setMsg('Pill name is required.');
+      return;
+    }
+    if (!scheduledAt) {
+      setMsg('Dose time is required.');
+      return;
+    }
+    const qty = Number(requiredPills);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      setMsg('Required pills must be greater than 0.');
+      return;
+    }
+
+    setBusy(true);
+    setMsg('');
+    try {
+      await apiFetch(`/api/devices/${device.id}/doses`, token, {
+        method: 'POST',
+        body: JSON.stringify({
+          pillName: pillName.trim(),
+          scheduledAt: new Date(scheduledAt).toISOString(),
+          requiredPills: qty,
+        }),
+      });
+      setMsg('Dose reminder saved.');
+      setPillName('');
+      setRequiredPills('1');
+      setScheduledAt(defaultDoseTimeInputValue());
+      onRefresh();
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : 'Error');
+    } finally {
+      setBusy(false);
+    }
   }
 
   const updatedLabel = device.status?.updatedAt
@@ -185,6 +240,42 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
                 <Button className="h-8 px-3 text-xs" variant="outline" onClick={() => sendCommand('LED_OFF')} disabled={busy}>
                   LED off
                 </Button>
+              </div>
+            </div>
+
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">Medication Reminder</p>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <div className="space-y-1 sm:col-span-3">
+                  <Label className="text-xs">Pill name</Label>
+                  <Input value={pillName} onChange={(e) => setPillName(e.target.value)} className="h-8 text-sm" placeholder="e.g. Metformin" />
+                </div>
+                <div className="space-y-1 sm:col-span-2">
+                  <Label className="text-xs">Dose time</Label>
+                  <Input type="datetime-local" value={scheduledAt} onChange={(e) => setScheduledAt(e.target.value)} className="h-8 text-sm" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Required pills</Label>
+                  <Input value={requiredPills} onChange={(e) => setRequiredPills(e.target.value)} className="h-8 text-sm" />
+                </div>
+              </div>
+              <div className="mt-2">
+                <Button className="h-8 px-3 text-xs" onClick={() => void saveDoseSchedule()} disabled={busy}>
+                  Save reminder
+                </Button>
+              </div>
+
+              <div className="mt-3 space-y-1">
+                {(device.upcomingDoses?.length ?? 0) > 0 ? (
+                  device.upcomingDoses!.map((dose) => (
+                    <p key={dose.id} className="text-xs text-slate-400">
+                      {new Date(dose.scheduledAt).toLocaleString()} • {dose.pillName} • {dose.requiredPills} pill(s)
+                      {dose.alertTriggeredAt ? ' • alert sent' : ''}
+                    </p>
+                  ))
+                ) : (
+                  <p className="text-xs text-slate-500">No upcoming doses scheduled.</p>
+                )}
               </div>
             </div>
 

@@ -7,32 +7,33 @@ datasource db {
 }
 
 model User {
-  id           String          @id @default(uuid())
-  email        String          @unique
+  id           String   @id @default(uuid())
+  email        String   @unique
   name         String?
   passwordHash String
-  createdAt    DateTime        @default(now())
+  createdAt    DateTime @default(now())
 
-  ownedDevices Device[]        @relation("DeviceOwner")
-  lockedDevices Device[]       @relation("DeviceLockOwner")
-  commands     DeviceCommand[]
+  ownedDevices  Device[]        @relation("DeviceOwner")
+  lockedDevices Device[]        @relation("DeviceLockOwner")
+  commands      DeviceCommand[]
 }
 
 model Device {
-  id                  String               @id @default(uuid())
-  hardwareId          String               @unique
+  id                  String    @id @default(uuid())
+  hardwareId          String    @unique
   deviceSecret        String
   label               String?
   ownerUserId         String?
   lockedByUserId      String?
   pairedAt            DateTime?
   lastPhysicalResetAt DateTime?
-  createdAt           DateTime             @default(now())
+  createdAt           DateTime  @default(now())
 
   owner         User?                @relation("DeviceOwner", fields: [ownerUserId], references: [id])
   lockOwner     User?                @relation("DeviceLockOwner", fields: [lockedByUserId], references: [id])
   commands      DeviceCommand[]
   events        DeviceEvent[]
+  doses         DeviceDose[]
   runtimeStatus DeviceRuntimeStatus?
 }
 
@@ -83,4 +84,25 @@ model DeviceEvent {
   device Device @relation(fields: [deviceId], references: [id])
 
   @@index([deviceId, createdAt])
+}
+
+model DeviceDose {
+  id               String    @id @default(uuid())
+  deviceId         String
+  pillName         String
+  scheduledAt      DateTime
+  requiredPills    Int       @default(1)
+  alertTriggeredAt DateTime?
+  lastReminderAt   DateTime?
+  reminderCount    Int       @default(0)
+  completedAt      DateTime?
+  takenPills       Int?
+  overdoseDetected Boolean   @default(false)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, scheduledAt])
+  @@index([deviceId, completedAt])
 }
