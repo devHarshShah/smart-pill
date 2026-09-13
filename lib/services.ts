@@ -131,7 +131,14 @@ export async function registerDevice(input: { hardwareId: string; deviceSecret: 
 export async function listDevicesForUser(userId: string) {
   const devices = await prisma.device.findMany({
     where: { ownerUserId: userId },
-    include: { runtimeStatus: true },
+    include: {
+      runtimeStatus: true,
+      doses: {
+        where: { completedAt: null },
+        orderBy: { scheduledAt: 'asc' },
+        take: 5,
+      },
+    },
     orderBy: { createdAt: 'desc' },
   });
 
@@ -154,6 +161,15 @@ export async function listDevicesForUser(userId: string) {
             updatedAt: device.runtimeStatus.updatedAt,
           }
         : undefined,
+      upcomingDoses: device.doses.map((dose) => ({
+        id: dose.id,
+        pillName: dose.pillName,
+        scheduledAt: dose.scheduledAt,
+        requiredPills: dose.requiredPills,
+        alertTriggeredAt: dose.alertTriggeredAt,
+        lastReminderAt: dose.lastReminderAt,
+        reminderCount: dose.reminderCount,
+      })),
     })),
   };
 }
@@ -255,6 +271,28 @@ export async function logDeviceEvent(input: {
     },
   });
 
+  const payload =
+    input.payload && typeof input.payload === 'object' && !Array.isArray(input.payload)
+      ? (input.payload as Record<string, unknown>)
+      : null;
+  const doseId = typeof payload?.doseId === 'string' ? payload.doseId : null;
+  const takenPills = typeof payload?.takenPills === 'number' ? Math.floor(payload.takenPills) : null;
+
+  if (doseId && (type === 'DOSE_COMPLETED' || type === 'DOSE_OVERDOSE')) {
+    await prisma.deviceDose.updateMany({
+      where: {
+        id: doseId,
+        deviceId: device.id,
+        completedAt: null,
+      },
+      data: {
+        completedAt: new Date(),
+        takenPills: takenPills ?? undefined,
+        overdoseDetected: type === 'DOSE_OVERDOSE',
+      },
+    });
+  }
+
   return { ok: true, event };
 }
 
@@ -278,6 +316,66 @@ export async function listDeviceEventsForUser(input: {
   });
 
   return { events };
+}
+
+export async function createDoseForUser(input: {
+  userId: string;
+  deviceId: string;
+  pillName: string;
+  scheduledAt: Date;
+  requiredPills: number;
+}) {
+  const device = await prisma.device.findUnique({ where: { id: input.deviceId } });
+  if (!device) {
+    return { error: 'Device not found' as const };
+  }
+  if (device.ownerUserId !== input.userId) {
+    return { error: 'Device does not belong to user' as const };
+  }
+
+  if (!input.pillName.trim()) {
+    return { error: 'pillName is required' as const };
+  }
+
+  if (!Number.isFinite(input.requiredPills) || input.requiredPills <= 0) {
+    return { error: 'requiredPills must be greater than 0' as const };
+  }
+
+  const dose = await prisma.deviceDose.create({
+    data: {
+      deviceId: input.deviceId,
+      pillName: input.pillName.trim(),
+      scheduledAt: input.scheduledAt,
+      requiredPills: Math.floor(input.requiredPills),
+    },
+  });
+
+  return { dose };
+}
+
+export async function listDosesForUser(input: {
+  userId: string;
+  deviceId: string;
+  includeCompleted?: boolean;
+}) {
+  const device = await prisma.device.findUnique({ where: { id: input.deviceId } });
+  if (!device) {
+    return { error: 'Device not found' as const };
+  }
+  if (device.ownerUserId !== input.userId) {
+    return { error: 'Device does not belong to user' as const };
+  }
+
+  const doses = await prisma.deviceDose.findMany({
+    where: {
+      deviceId: input.deviceId,
+      ...(input.includeCompleted ? {} : { completedAt: null }),
+    },
+    orderBy: { scheduledAt: 'asc' },
+    take: 100,
+  });
+
+  return { doses };
 }
 
 export async function enqueueCommand(input: {
@@ -328,6 +426,81 @@ export async function pollDeviceCommands(input: { hardwareId: string; deviceSecr
   }
 
   const commands = await prisma.$transaction(async (tx) => {
+    const now = new Date();
+    const secondReminderThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+
+    const firstDueDose = await tx.deviceDose.findFirst({
+      where: {
+        deviceId: device.id,
+        completedAt: null,
+        alertTriggeredAt: null,
+        scheduledAt: { lte: now },
+      },
+      orderBy: { scheduledAt: 'asc' },
+    });
+
+    if (firstDueDose) {
+      await tx.deviceCommand.create({
+        data: {
+          deviceId: device.id,
+          userId: device.ownerUserId!,
+          command: 'REMINDER_START',
+          payload: {
+            doseId: firstDueDose.id,
+            pillName: firstDueDose.pillName,
+            requiredPills: firstDueDose.requiredPills,
+            scheduledAt: firstDueDose.scheduledAt.toISOString(),
+            reminderNumber: 1,
+          },
+        },
+      });
+
+      await tx.deviceDose.update({
+        where: { id: firstDueDose.id },
+        data: {
+          alertTriggeredAt: now,
+          lastReminderAt: now,
+          reminderCount: 1,
+        },
+      });
+    } else {
+      const secondDueDose = await tx.deviceDose.findFirst({
+        where: {
+          deviceId: device.id,
+          completedAt: null,
+          alertTriggeredAt: { not: null },
+          reminderCount: 1,
+          lastReminderAt: { lte: secondReminderThreshold },
+        },
+        orderBy: { scheduledAt: 'asc' },
+      });
+
+      if (secondDueDose) {
+        await tx.deviceCommand.create({
+          data: {
+            deviceId: device.id,
+            userId: device.ownerUserId!,
+            command: 'REMINDER_START',
+            payload: {
+              doseId: secondDueDose.id,
+              pillName: secondDueDose.pillName,
+              requiredPills: secondDueDose.requiredPills,
+              scheduledAt: secondDueDose.scheduledAt.toISOString(),
+              reminderNumber: 2,
+            },
+          },
+        });
+
+        await tx.deviceDose.update({
+          where: { id: secondDueDose.id },
+          data: {
+            lastReminderAt: now,
+            reminderCount: { increment: 1 },
+          },
+        });
+      }
+    }
+
     const queued = await tx.deviceCommand.findMany({
       where: { deviceId: device.id },
       orderBy: { createdAt: 'asc' },

@@ -21,6 +21,7 @@ const char* DEVICE_SECRET = "esp32-secret-001";
 const unsigned long POLL_INTERVAL_MS = 4000;
 const unsigned long STATUS_INTERVAL_MS = 10000;
 const unsigned long MONITOR_WARMUP_MS = 1500;
+const unsigned long OVERDOSE_BUZZ_MS = 5000;
 
 unsigned long lastPollMs = 0;
 unsigned long lastStatusMs = 0;
@@ -37,6 +38,12 @@ bool setupMismatch = false;
 int detectedPills = 0;
 int pendingCount = -1;
 int confirmStreak = 0;
+
+bool reminderActive = false;
+String activeDoseId = "";
+String activePillName = "";
+int activeRequiredPills = 1;
+int activeTakenPills = 0;
 
 String wifiStateLabel(wl_status_t s) {
   switch (s) {
@@ -55,10 +62,8 @@ String wifiStateLabel(wl_status_t s) {
 void beep(int times) {
   for (int i = 0; i < times; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
-    digitalWrite(LED_PIN, HIGH);
     delay(200);
     digitalWrite(BUZZER_PIN, LOW);
-    digitalWrite(LED_PIN, LOW);
     delay(150);
   }
 }
@@ -183,6 +188,70 @@ bool extractBool(String text, String key, bool fallback) {
   if (text.substring(pos, pos + 4) == "true") return true;
   if (text.substring(pos, pos + 5) == "false") return false;
   return fallback;
+}
+
+String extractString(String text, String key, String fallback) {
+  String token = "\"" + key + "\":";
+  int pos = text.indexOf(token);
+  if (pos < 0) return fallback;
+  pos += token.length();
+
+  while (pos < (int)text.length() && text[pos] == ' ') pos++;
+  if (pos >= (int)text.length() || text[pos] != '"') return fallback;
+  pos += 1;
+
+  int end = text.indexOf("\"", pos);
+  if (end < 0) return fallback;
+  return text.substring(pos, end);
+}
+
+void buzzContinuous(unsigned long ms) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void postDeviceEvent(String type, String payloadJsonObject) {
+  int code = 0;
+  String res = "";
+  String payload = "{\"hardwareId\":\"" + String(HARDWARE_ID) +
+                   "\",\"deviceSecret\":\"" + String(DEVICE_SECRET) +
+                   "\",\"type\":\"" + type + "\"" +
+                   ",\"payload\":" + payloadJsonObject +
+                   "}";
+  bool ok = postJson("/api/device/events", payload, code, res);
+  if (!ok) {
+    Serial.println("[EVENT] post failed");
+    return;
+  }
+  Serial.print("[EVENT] post status=");
+  Serial.println(code);
+}
+
+void startDoseReminder(String json) {
+  String nextDoseId = extractString(json, "doseId", "");
+  String nextPillName = extractString(json, "pillName", "Medicine");
+  int nextRequiredPills = extractInt(json, "requiredPills", 1);
+  if (nextRequiredPills <= 0) nextRequiredPills = 1;
+
+  bool sameActiveDose = reminderActive && nextDoseId.length() > 0 && nextDoseId == activeDoseId;
+  if (!sameActiveDose) {
+    activeDoseId = nextDoseId;
+    activePillName = nextPillName;
+    activeRequiredPills = nextRequiredPills;
+    activeTakenPills = 0;
+  }
+  reminderActive = true;
+
+  digitalWrite(LED_PIN, HIGH);
+  beep(2);
+
+  Serial.print("[REMINDER] active doseId=");
+  Serial.print(activeDoseId);
+  Serial.print(" pill=");
+  Serial.print(activePillName);
+  Serial.print(" requiredPills=");
+  Serial.println(activeRequiredPills);
 }
 
 void calibrateOnePillAsUnit() {
@@ -316,6 +385,9 @@ void handleCommands(String json) {
     Serial.println("[CMD] LED_OFF");
     digitalWrite(LED_PIN, LOW);
   }
+  if (json.indexOf("\"command\":\"REMINDER_START\"") >= 0) {
+    startDoseReminder(json);
+  }
   if (json.indexOf("\"command\":\"RESET_SETUP\"") >= 0) {
     setupDone = false;
     pillUnitMode = true;
@@ -324,6 +396,12 @@ void handleCommands(String json) {
     totalPills = 0;
     currentPills = 0;
     pillWeight = 0;
+    reminderActive = false;
+    activeDoseId = "";
+    activePillName = "";
+    activeRequiredPills = 1;
+    activeTakenPills = 0;
+    digitalWrite(LED_PIN, LOW);
     Serial.println("[SETUP] reset");
   }
 }
@@ -405,7 +483,40 @@ void monitorPills() {
         Serial.print(taken);
         Serial.print(" remaining=");
         Serial.println(newCount);
-        beep(taken);
+
+        if (reminderActive) {
+          activeTakenPills += taken;
+
+          if (activeTakenPills > activeRequiredPills) {
+            Serial.println("[REMINDER] overdose detected");
+            buzzContinuous(OVERDOSE_BUZZ_MS);
+            digitalWrite(LED_PIN, LOW);
+            reminderActive = false;
+            postDeviceEvent("DOSE_OVERDOSE",
+              "{\"doseId\":\"" + activeDoseId + "\",\"pillName\":\"" + activePillName +
+              "\",\"requiredPills\":" + String(activeRequiredPills) +
+              ",\"takenPills\":" + String(activeTakenPills) + "}");
+            activeDoseId = "";
+            activePillName = "";
+            activeRequiredPills = 1;
+            activeTakenPills = 0;
+          } else if (activeTakenPills == activeRequiredPills) {
+            Serial.println("[REMINDER] dose completed");
+            beep(1);
+            digitalWrite(LED_PIN, LOW);
+            reminderActive = false;
+            postDeviceEvent("DOSE_COMPLETED",
+              "{\"doseId\":\"" + activeDoseId + "\",\"pillName\":\"" + activePillName +
+              "\",\"requiredPills\":" + String(activeRequiredPills) +
+              ",\"takenPills\":" + String(activeTakenPills) + "}");
+            activeDoseId = "";
+            activePillName = "";
+            activeRequiredPills = 1;
+            activeTakenPills = 0;
+          }
+        } else {
+          beep(taken);
+        }
       } else {
         Serial.print("[PILL] added newCount=");
         Serial.println(newCount);
