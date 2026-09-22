@@ -68,7 +68,7 @@ export async function signup(input: { email: string; password: string; name?: st
     },
   });
 
-  const token = createUserToken(user.id);
+  const token = createUserToken(user.id, { email: user.email, name: user.name ?? undefined });
   return {
     token,
     user: sanitizeUser(user),
@@ -83,7 +83,7 @@ export async function login(input: { email: string; password: string }) {
     return { error: 'Invalid email or password' as const };
   }
 
-  const token = createUserToken(user.id);
+  const token = createUserToken(user.id, { email: user.email, name: user.name ?? undefined });
   return {
     token,
     user: sanitizeUser(user),
