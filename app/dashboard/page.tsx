@@ -1,26 +1,17 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-
+import { useEffect, useState } from 'react';
+import { Cpu, Pill, TrendingUp, CalendarClock, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { clearStoredToken, getStoredToken } from '@/lib/client/auth';
+import { Progress } from '@/components/ui/progress';
+import { getStoredToken, getStoredUser } from '@/lib/client/auth';
 
 type DeviceStatus = {
   wifiConnected?: boolean;
-  ip?: string;
-  rssi?: number;
-  setupDone?: boolean;
-  setupMismatch?: boolean;
-  detectedPills?: number;
-  pillWeight?: number;
-  threshold?: number;
-  confirmReads?: number;
   currentPills?: number;
   totalPills?: number;
+  setupDone?: boolean;
   updatedAt?: string;
 };
 
@@ -28,400 +19,237 @@ type DeviceItem = {
   id: string;
   hardwareId: string;
   label?: string;
-  pairedAt?: string;
   status?: DeviceStatus;
-  upcomingDoses?: Array<{
-    id: string;
-    pillName: string;
-    scheduledAt: string;
-    requiredPills: number;
-    alertTriggeredAt?: string | null;
-  }>;
+  upcomingDoses?: Array<{ id: string; pillName: string; scheduledAt: string; requiredPills: number }>;
 };
 
-function defaultDoseTimeInputValue() {
-  const target = new Date(Date.now() + 60 * 60 * 1000);
-  target.setSeconds(0, 0);
-  const tzOffset = target.getTimezoneOffset() * 60 * 1000;
-  return new Date(target.getTime() - tzOffset).toISOString().slice(0, 16);
-}
-
-async function apiFetch<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: {
-      'content-type': 'application/json',
-      Authorization: `Bearer ${token}`,
-      ...(init.headers ?? {}),
-    },
-  });
-  const data = (await res.json()) as T & { error?: string };
-  if (!res.ok) throw new Error((data as { error?: string }).error ?? `Request failed (${res.status})`);
-  return data;
-}
-
-function isOnline(updatedAt?: string): boolean {
+function isOnline(updatedAt?: string) {
   if (!updatedAt) return false;
   return Date.now() - new Date(updatedAt).getTime() < 30_000;
 }
 
-function PillBar({ current, total }: { current: number; total: number }) {
-  const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
-  const color = pct < 20 ? 'bg-red-500' : pct < 50 ? 'bg-yellow-400' : 'bg-emerald-500';
-  return (
-    <div className="mt-3">
-      <div className="mb-1 flex items-end justify-between">
-        <span className="text-4xl font-bold tabular-nums text-slate-100">{current}</span>
-        <span className="mb-1 text-sm text-slate-400">/ {total} pills</span>
-      </div>
-      <div className="h-3 w-full overflow-hidden rounded-full bg-slate-700">
-        <div className={`h-full rounded-full transition-all duration-500 ${color}`} style={{ width: `${pct}%` }} />
-      </div>
-      <p className={`mt-1 text-xs font-medium ${pct < 20 ? 'text-red-400' : pct < 50 ? 'text-yellow-400' : 'text-emerald-400'}`}>
-        {pct}% remaining
-      </p>
-    </div>
-  );
+async function apiFetch<T>(path: string, token: string): Promise<T> {
+  const res = await fetch(path, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await res.json() as T;
+  return data;
 }
 
-function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: string; onRefresh: () => void }) {
-  const [expanded, setExpanded] = useState(false);
-  const [totalPills, setTotalPills] = useState('15');
-  const [currentPills, setCurrentPills] = useState('15');
-  const [pillName, setPillName] = useState('');
-  const [scheduledAt, setScheduledAt] = useState(defaultDoseTimeInputValue());
-  const [requiredPills, setRequiredPills] = useState('1');
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState('');
-
-  const online = isOnline(device.status?.updatedAt);
-  const hasPillData = device.status?.currentPills != null && device.status?.totalPills != null;
-
-  async function sendCommand(command: string, payload?: unknown) {
-    setBusy(true);
-    setMsg('');
-    try {
-      await apiFetch(`/api/devices/${device.id}/commands`, token, {
-        method: 'POST',
-        body: JSON.stringify({ command, payload }),
-      });
-      setMsg(`${command} queued.`);
-    } catch (e) {
-      setMsg(e instanceof Error ? e.message : 'Error');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function queueCalibration() {
-    await sendCommand('SET_CALIBRATION', {
-      pillWeight: 1,
-      pillUnitMode: true,
-      totalPills: Number(totalPills),
-      currentPills: Number(currentPills),
-    });
-    onRefresh();
-  }
-
-  async function saveDoseSchedule() {
-    if (!pillName.trim()) {
-      setMsg('Pill name is required.');
-      return;
-    }
-    if (!scheduledAt) {
-      setMsg('Dose time is required.');
-      return;
-    }
-    const qty = Number(requiredPills);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      setMsg('Required pills must be greater than 0.');
-      return;
-    }
-
-    setBusy(true);
-    setMsg('');
-    try {
-      await apiFetch(`/api/devices/${device.id}/doses`, token, {
-        method: 'POST',
-        body: JSON.stringify({
-          pillName: pillName.trim(),
-          scheduledAt: new Date(scheduledAt).toISOString(),
-          requiredPills: qty,
-        }),
-      });
-      setMsg('Dose reminder saved.');
-      setPillName('');
-      setRequiredPills('1');
-      setScheduledAt(defaultDoseTimeInputValue());
-      onRefresh();
-    } catch (e) {
-      setMsg(e instanceof Error ? e.message : 'Error');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const updatedLabel = device.status?.updatedAt
-    ? new Date(device.status.updatedAt).toLocaleTimeString()
-    : null;
-
-  return (
-    <Card className="overflow-hidden border-slate-700 bg-slate-900">
-      <CardHeader className="pb-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className={`h-2.5 w-2.5 rounded-full ${online ? 'bg-emerald-400 shadow-[0_0_6px_#34d399]' : 'bg-slate-500'}`} />
-            <CardTitle className="text-lg">{device.label ?? device.hardwareId}</CardTitle>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            <Badge tone={online ? 'success' : undefined}>{online ? 'Online' : 'Offline'}</Badge>
-            {device.status && !device.status.setupDone && (
-              <Badge tone="warn">Setup needed</Badge>
-            )}
-            {device.status?.setupMismatch && (
-              <Badge tone="warn">Count mismatch</Badge>
-            )}
-          </div>
-        </div>
-        {updatedLabel && (
-          <p className="text-xs text-slate-500">Last update: {updatedLabel}</p>
-        )}
-      </CardHeader>
-
-      <CardContent className="space-y-4">
-        {hasPillData ? (
-          <PillBar current={device.status!.currentPills!} total={device.status!.totalPills!} />
-        ) : (
-          <p className="text-sm text-slate-500">No pill data yet. Push calibration to get started.</p>
-        )}
-
-        <button
-          className="flex w-full items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
-          onClick={() => setExpanded((v) => !v)}
-        >
-          <span className="select-none">{expanded ? '▾' : '▸'}</span>
-          Setup &amp; Commands
-        </button>
-
-        {expanded && (
-          <div className="space-y-4 rounded-lg border border-slate-700 bg-slate-950 p-4">
-            <div>
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">Calibration</p>
-              <p className="mb-3 text-xs text-slate-500">Step 1: place exactly 1 pill on the scale and click Calibrate. Step 2: set pill counts and click Apply. Do Step 1 first on a new device or after a physical reset.</p>
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1">
-                  <Label className="text-xs">Total pills</Label>
-                  <Input value={totalPills} onChange={(e) => setTotalPills(e.target.value)} className="h-8 text-sm" />
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">Current pills</Label>
-                  <Input value={currentPills} onChange={(e) => setCurrentPills(e.target.value)} className="h-8 text-sm" />
-                </div>
-              </div>
-              <div className="mt-2 flex flex-wrap gap-2">
-                <Button className="h-8 px-3 text-xs" variant="outline" onClick={() => sendCommand('CALIBRATE_ONE_PILL')} disabled={busy}>
-                  Step 1: Calibrate (1 pill on scale)
-                </Button>
-                <Button className="h-8 px-3 text-xs" onClick={queueCalibration} disabled={busy}>
-                  Step 2: Apply counts
-                </Button>
-              </div>
-            </div>
-
-            <div>
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">Quick Commands</p>
-              <div className="flex flex-wrap gap-2">
-                <Button className="h-8 px-3 text-xs" variant="outline" onClick={() => sendCommand('BUZZER_TEST', { times: 2 })} disabled={busy}>
-                  Buzzer test
-                </Button>
-                <Button className="h-8 px-3 text-xs" variant="outline" onClick={() => sendCommand('LED_ON')} disabled={busy}>
-                  LED on
-                </Button>
-                <Button className="h-8 px-3 text-xs" variant="outline" onClick={() => sendCommand('LED_OFF')} disabled={busy}>
-                  LED off
-                </Button>
-              </div>
-            </div>
-
-            <div>
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">Medication Reminder</p>
-              <div className="grid gap-2 sm:grid-cols-3">
-                <div className="space-y-1 sm:col-span-3">
-                  <Label className="text-xs">Pill name</Label>
-                  <Input value={pillName} onChange={(e) => setPillName(e.target.value)} className="h-8 text-sm" placeholder="e.g. Metformin" />
-                </div>
-                <div className="space-y-1 sm:col-span-2">
-                  <Label className="text-xs">Dose time</Label>
-                  <Input type="datetime-local" value={scheduledAt} onChange={(e) => setScheduledAt(e.target.value)} className="h-8 text-sm" />
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">Required pills</Label>
-                  <Input value={requiredPills} onChange={(e) => setRequiredPills(e.target.value)} className="h-8 text-sm" />
-                </div>
-              </div>
-              <div className="mt-2">
-                <Button className="h-8 px-3 text-xs" onClick={() => void saveDoseSchedule()} disabled={busy}>
-                  Save reminder
-                </Button>
-              </div>
-
-              <div className="mt-3 space-y-1">
-                {(device.upcomingDoses?.length ?? 0) > 0 ? (
-                  device.upcomingDoses!.map((dose) => (
-                    <p key={dose.id} className="text-xs text-slate-400">
-                      {new Date(dose.scheduledAt).toLocaleString()} • {dose.pillName} • {dose.requiredPills} pill(s)
-                      {dose.alertTriggeredAt ? ' • alert sent' : ''}
-                    </p>
-                  ))
-                ) : (
-                  <p className="text-xs text-slate-500">No upcoming doses scheduled.</p>
-                )}
-              </div>
-            </div>
-
-            {msg && <p className="text-xs text-cyan-300">{msg}</p>}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-export default function DashboardPage() {
-  const [token, setToken] = useState('');
-  const [userEmail, setUserEmail] = useState('');
+export default function OverviewPage() {
+  const [token] = useState(() => getStoredToken());
+  const [userName] = useState(() => getStoredUser()?.name ?? 'there');
   const [devices, setDevices] = useState<DeviceItem[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [claimId, setClaimId] = useState('');
-  const [claiming, setClaiming] = useState(false);
-  const [claimError, setClaimError] = useState('');
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    const t = getStoredToken();
-    setToken(t);
-    if (t) {
-      // Decode email from JWT payload (base64)
-      try {
-        const payload = JSON.parse(atob(t.split('.')[1])) as { email?: string };
-        setUserEmail(payload.email ?? '');
-      } catch {}
-    }
-  }, []);
-
-  async function fetchDevices(t: string) {
-    try {
-      const result = await apiFetch<{ devices: DeviceItem[] }>('/api/devices', t);
-      setDevices(result.devices ?? []);
-      setError('');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load devices');
-    }
-  }
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!token) return;
-    setLoading(true);
-    fetchDevices(token).finally(() => setLoading(false));
-
-    pollRef.current = setInterval(() => {
-      void fetchDevices(token);
-    }, 10_000);
-
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
+    apiFetch<{ devices: DeviceItem[] }>('/api/devices', token)
+      .then((r) => setDevices(r.devices ?? []))
+      .finally(() => setLoading(false));
   }, [token]);
 
-  function logout() {
-    clearStoredToken();
-    setToken('');
-    setDevices([]);
-  }
+  const onlineDevices = devices.filter((d) => isOnline(d.status?.updatedAt));
+  const totalDosesToday = devices.flatMap((d) => d.upcomingDoses ?? []).filter((dose) => {
+    const dt = new Date(dose.scheduledAt);
+    const now = new Date();
+    return dt.toDateString() === now.toDateString();
+  });
 
-  async function claimDevice() {
-    if (!claimId.trim()) return;
-    setClaiming(true);
-    setClaimError('');
-    try {
-      await apiFetch('/api/pairing/claim', token, {
-        method: 'POST',
-        body: JSON.stringify({ hardwareId: claimId.trim() }),
-      });
-      setClaimId('');
-      await fetchDevices(token);
-    } catch (e) {
-      setClaimError(e instanceof Error ? e.message : 'Failed to pair device');
-    } finally {
-      setClaiming(false);
-    }
-  }
+  const stats = [
+    {
+      title: 'Devices Online',
+      value: loading ? '—' : `${onlineDevices.length} / ${devices.length}`,
+      icon: Cpu,
+      color: 'text-emerald-400',
+      bgColor: 'bg-emerald-400/10',
+    },
+    {
+      title: "Today's Doses",
+      value: loading ? '—' : String(totalDosesToday.length),
+      icon: Pill,
+      color: 'text-primary',
+      bgColor: 'bg-primary/10',
+    },
+    {
+      title: 'Active Schedules',
+      value: loading ? '—' : String(devices.reduce((a, d) => a + (d.upcomingDoses?.length ?? 0), 0)),
+      icon: CalendarClock,
+      color: 'text-amber-400',
+      bgColor: 'bg-amber-400/10',
+    },
+    {
+      title: 'Adherence (7d)',
+      value: '—',
+      icon: TrendingUp,
+      color: 'text-cyan-400',
+      bgColor: 'bg-cyan-400/10',
+    },
+  ];
 
-  if (!token) {
-    return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
-        <div className="text-center">
-          <p className="text-lg text-slate-400">Not logged in.</p>
-          <a href="/auth?mode=login" className="mt-2 block text-cyan-400 hover:underline">Sign in →</a>
-        </div>
-      </main>
-    );
-  }
+  const now = new Date();
+  const hour = now.getHours();
+  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
 
   return (
-    <main className="min-h-screen bg-slate-950 px-4 py-8 text-slate-100 sm:px-8">
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+    <div className="space-y-6">
+      {/* Greeting */}
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight">
+          {greeting}, {userName} 👋
+        </h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Here&apos;s an overview of your medication monitoring system.
+        </p>
+      </div>
 
-        {/* Header */}
-        <header className="flex items-center justify-between">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-widest text-cyan-400">MediLink</p>
-            <h1 className="mt-0.5 text-2xl font-bold">Pill Monitor</h1>
-            {userEmail && <p className="text-sm text-slate-400">{userEmail}</p>}
-          </div>
-          <Button variant="ghost" onClick={logout}>Logout</Button>
-        </header>
+      {/* Stats */}
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {stats.map((s) => (
+          <Card key={s.title} className="border-border/50">
+            <CardContent className="p-6">
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-medium text-muted-foreground">{s.title}</p>
+                <div className={`rounded-lg p-2 ${s.bgColor}`}>
+                  <s.icon className={`h-4 w-4 ${s.color}`} />
+                </div>
+              </div>
+              <p className="mt-3 text-3xl font-bold tabular-nums">{s.value}</p>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
 
-        {error && <p className="rounded-lg bg-red-950 px-4 py-2 text-sm text-red-300">{error}</p>}
+      {/* Devices summary */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card className="border-border/50">
+          <CardHeader>
+            <CardTitle className="text-base">Device Status</CardTitle>
+            <CardDescription>Real-time status of your paired pill monitors</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {loading ? (
+              <div className="space-y-3">
+                {[1, 2].map((i) => (
+                  <div key={i} className="h-12 rounded-lg bg-muted animate-pulse" />
+                ))}
+              </div>
+            ) : devices.length === 0 ? (
+              <div className="flex flex-col items-center gap-2 py-8 text-center">
+                <Cpu className="h-8 w-8 text-muted-foreground/50" />
+                <p className="text-sm text-muted-foreground">No devices paired yet.</p>
+                <a href="/dashboard/devices" className="text-xs text-primary hover:underline">
+                  Pair your first device →
+                </a>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {devices.map((d) => {
+                  const online = isOnline(d.status?.updatedAt);
+                  const pct =
+                    d.status?.totalPills && d.status.currentPills != null
+                      ? Math.round((d.status.currentPills / d.status.totalPills) * 100)
+                      : null;
+                  return (
+                    <div key={d.id} className="flex items-center gap-3 rounded-lg border border-border/50 p-3">
+                      <span
+                        className={`h-2.5 w-2.5 shrink-0 rounded-full ${online ? 'bg-emerald-400 shadow-[0_0_6px_theme(colors.emerald.400)]' : 'bg-muted-foreground/40'}`}
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium truncate">{d.label ?? d.hardwareId}</p>
+                        {pct !== null && (
+                          <div className="mt-1 flex items-center gap-2">
+                            <Progress
+                              value={pct}
+                              className="h-1.5 flex-1"
+                            />
+                            <span className="text-xs text-muted-foreground whitespace-nowrap">{pct}%</span>
+                          </div>
+                        )}
+                      </div>
+                      <Badge variant={online ? 'default' : 'secondary'} className="shrink-0 text-xs">
+                        {online ? 'Online' : 'Offline'}
+                      </Badge>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
 
-        {/* Devices */}
-        {loading && devices.length === 0 ? (
-          <p className="text-sm text-slate-400">Loading devices…</p>
-        ) : devices.length === 0 ? (
-          <div className="rounded-2xl border border-slate-700 bg-slate-900 p-8 text-center">
-            <p className="text-lg font-semibold">No devices paired yet</p>
-            <p className="mt-1 text-sm text-slate-400">Boot your ESP32 then enter its hardware ID below.</p>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-4">
-            {devices.map((d) => (
-              <DeviceCard key={d.id} device={d} token={token} onRefresh={() => fetchDevices(token)} />
+        <Card className="border-border/50">
+          <CardHeader>
+            <CardTitle className="text-base">Upcoming Doses Today</CardTitle>
+            <CardDescription>Medications scheduled for today</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {loading ? (
+              <div className="space-y-3">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="h-10 rounded-lg bg-muted animate-pulse" />
+                ))}
+              </div>
+            ) : totalDosesToday.length === 0 ? (
+              <div className="flex flex-col items-center gap-2 py-8 text-center">
+                <CheckCircle2 className="h-8 w-8 text-emerald-400/60" />
+                <p className="text-sm text-muted-foreground">No doses scheduled for today.</p>
+                <a href="/dashboard/pills" className="text-xs text-primary hover:underline">
+                  Add a medication →
+                </a>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {totalDosesToday.slice(0, 6).map((dose) => {
+                  const t = new Date(dose.scheduledAt);
+                  const isPast = t < now;
+                  return (
+                    <div key={dose.id} className="flex items-center gap-3 rounded-lg border border-border/40 px-3 py-2">
+                      {isPast ? (
+                        <AlertCircle className="h-4 w-4 shrink-0 text-amber-400" />
+                      ) : (
+                        <Pill className="h-4 w-4 shrink-0 text-primary" />
+                      )}
+                      <p className="flex-1 text-sm font-medium">{dose.pillName}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Quick actions */}
+      <Card className="border-border/50">
+        <CardHeader>
+          <CardTitle className="text-base">Quick Actions</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-3 sm:grid-cols-3">
+            {[
+              { href: '/dashboard/pills', icon: Pill, label: 'Add Medication', desc: 'Set up a new pill schedule' },
+              { href: '/dashboard/schedule', icon: CalendarClock, label: 'Edit Schedule', desc: 'Update meal & dose times' },
+              { href: '/dashboard/devices', icon: Cpu, label: 'Pair Device', desc: 'Connect a new pill monitor' },
+            ].map((a) => (
+              <a
+                key={a.href}
+                href={a.href}
+                className="flex items-start gap-3 rounded-xl border border-border/50 p-4 hover:bg-accent/50 hover:border-primary/30 transition-all duration-150 group"
+              >
+                <div className="rounded-lg bg-primary/10 p-2 group-hover:bg-primary/20 transition-colors">
+                  <a.icon className="h-4 w-4 text-primary" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold">{a.label}</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">{a.desc}</p>
+                </div>
+              </a>
             ))}
           </div>
-        )}
-
-        {/* Claim form */}
-        <div className="rounded-2xl border border-slate-700 bg-slate-900 p-5">
-          <p className="mb-3 text-sm font-semibold text-slate-300">
-            {devices.length === 0 ? 'Pair your device' : 'Pair another device'}
-          </p>
-          <div className="flex gap-2">
-            <Input
-              placeholder="Hardware ID (e.g. esp32-pillbox-001)"
-              value={claimId}
-              onChange={(e) => setClaimId(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') void claimDevice(); }}
-              className="flex-1"
-            />
-            <Button onClick={() => void claimDevice()} disabled={claiming || !claimId.trim()}>
-              {claiming ? 'Pairing…' : 'Pair Device'}
-            </Button>
-          </div>
-          {claimError && <p className="mt-2 text-xs text-red-400">{claimError}</p>}
-        </div>
-
-      </div>
-    </main>
+        </CardContent>
+      </Card>
+    </div>
   );
 }

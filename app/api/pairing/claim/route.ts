@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 
-import { badRequest, conflict, forbidden, json, notFound, readJson, requireUser, unauthorized } from '@/lib/http';
+import { badRequest, forbidden, json, notFound, readJson, requireUser, unauthorized } from '@/lib/http';
 import { prisma } from '@/lib/prisma';
 
 type ClaimBody = {

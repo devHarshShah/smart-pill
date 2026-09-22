@@ -44,12 +44,14 @@ export function verifyPassword(password: string, passwordHash: string) {
   return timingSafeEqual(expectedHash, candidateHash);
 }
 
-export function createUserToken(userId: string) {
+export function createUserToken(userId: string, extra?: { email?: string; name?: string }) {
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     sub: userId,
     iat: now,
     exp: now + TOKEN_TTL_SECONDS,
+    ...(extra?.email ? { email: extra.email } : {}),
+    ...(extra?.name ? { name: extra.name } : {}),
   };
 
   const encodedPayload = base64UrlEncode(JSON.stringify(payload));
@@ -72,11 +74,13 @@ export function verifyUserToken(token: string): { userId: string } | null {
     return null;
   }
 
-  let payload: { sub?: string; exp?: number };
+  let payload: { sub?: string; exp?: number; email?: string; name?: string };
   try {
     payload = JSON.parse(base64UrlDecode(encodedPayload).toString('utf8')) as {
       sub?: string;
       exp?: number;
+      email?: string;
+      name?: string;
     };
   } catch {
     return null;

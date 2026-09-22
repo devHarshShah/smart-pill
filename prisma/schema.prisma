@@ -16,6 +16,21 @@ model User {
   ownedDevices  Device[]        @relation("DeviceOwner")
   lockedDevices Device[]        @relation("DeviceLockOwner")
   commands      DeviceCommand[]
+  schedule      UserSchedule?
+}
+
+model UserSchedule {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  breakfast       String   // "08:00"
+  morningSnack    String?  // "10:30"
+  lunch           String   // "13:30"
+  afternoonSnack  String?  // "16:00"
+  dinner          String   // "20:00"
+  bedtime         String?  // "22:00"
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
 }
 
 model Device {
@@ -35,6 +50,25 @@ model Device {
   events        DeviceEvent[]
   doses         DeviceDose[]
   runtimeStatus DeviceRuntimeStatus?
+  pillSchedules PillSchedule[]
+}
+
+model PillSchedule {
+  id            String    @id @default(uuid())
+  deviceId      String
+  pillName      String
+  frequencyType String    // "daily_once" | "twice_101" | "thrice" | "weekly" | "custom"
+  timesOfDay    String[]  // e.g. ["08:15", "20:15"]
+  daysOfWeek    Int[]     // 0=Sun…6=Sat, empty = every day
+  startDate     DateTime
+  endDate       DateTime?
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, active])
 }
 
 model DeviceCommand {
