@@ -1,23 +1,18 @@
-import type { Metadata } from "next";
-import "./globals.css";
-import { Geist } from "next/font/google";
-import { cn } from "@/lib/utils";
-
-const geist = Geist({subsets:['latin'],variable:'--font-sans'});
+import type { Metadata } from 'next';
+import './globals.css';
+import { TooltipProvider } from '@/components/ui/tooltip';
 
 export const metadata: Metadata = {
-  title: "MediLink Device Pairing",
-  description: "MVP dashboard for ESP32 pill reminder pairing and control.",
+  title: 'MediLink – Smart Pill Monitor',
+  description: 'Closed-loop smart pill monitoring and adherence tracking system.',
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={cn("h-full antialiased", "font-sans", geist.variable)}>
-      <body className="min-h-full flex flex-col">{children}</body>
+    <html lang="en">
+      <body>
+        <TooltipProvider>{children}</TooltipProvider>
+      </body>
     </html>
   );
 }
