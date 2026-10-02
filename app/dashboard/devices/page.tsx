@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import { Cpu, Plus, RefreshCw, Settings2, Zap } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -78,6 +79,18 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
     onRefresh();
   }
 
+  async function startCalibration() {
+    await sendCommand('CALIBRATE_ONE_PILL');
+    toast.success('Calibration command sent. Place exactly 1 pill on scale, then click "Apply counts".');
+  }
+
+  async function resetSetup() {
+    if (!confirm('Reset all pill setup on this device? This clears calibration and pill counts.')) return;
+    await sendCommand('RESET_SETUP');
+    toast.success('Reset command sent.');
+    onRefresh();
+  }
+
   return (
     <Card className="border-border/50 overflow-hidden">
       <CardHeader className="pb-3">
@@ -116,7 +129,7 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
           <div className="space-y-4 rounded-xl border border-border/50 bg-muted/20 p-4">
             <div>
               <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Calibration</p>
-              <p className="mb-3 text-xs text-muted-foreground">Step 1: place 1 pill on scale → Calibrate. Step 2: set counts → Apply.</p>
+              <p className="mb-3 text-xs text-muted-foreground">Step 1: Click Calibrate — follow the on-screen prompts. Step 2: Set pill counts → Apply.</p>
               <div className="grid grid-cols-2 gap-2 mb-3">
                 <div className="space-y-1">
                   <Label className="text-xs">Total pills</Label>
@@ -128,8 +141,8 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Button size="sm" variant="outline" onClick={() => sendCommand('CALIBRATE_ONE_PILL')} disabled={busy}>Step 1: Calibrate</Button>
-                <Button size="sm" onClick={queueCalibration} disabled={busy}>Step 2: Apply counts</Button>
+                <Button size="sm" variant="outline" onClick={() => void startCalibration()} disabled={busy}>Step 1: Calibrate</Button>
+                <Button size="sm" onClick={() => void queueCalibration()} disabled={busy}>Step 2: Apply counts</Button>
               </div>
             </div>
 
@@ -139,6 +152,14 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
                 <Button size="sm" variant="outline" onClick={() => sendCommand('BUZZER_TEST', { times: 2 })} disabled={busy}><Zap className="h-3 w-3 mr-1" />Buzzer</Button>
                 <Button size="sm" variant="outline" onClick={() => sendCommand('LED_ON')} disabled={busy}>LED On</Button>
                 <Button size="sm" variant="outline" onClick={() => sendCommand('LED_OFF')} disabled={busy}>LED Off</Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => void resetSetup()}
+                  disabled={busy}
+                >
+                  Reset Setup
+                </Button>
               </div>
             </div>
 

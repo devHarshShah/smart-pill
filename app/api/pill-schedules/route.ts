@@ -48,6 +48,29 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Device not found or not owned by user' }, { status: 404 });
   }
 
+  const runtime = await prisma.deviceRuntimeStatus.findUnique({ where: { deviceId: body.deviceId } });
+  if (!runtime || !runtime.setupDone) {
+    return NextResponse.json(
+      { error: 'Please calibrate and load pills on the device before creating a schedule.' },
+      { status: 409 },
+    );
+  }
+
+  const expected = body.totalPills;
+  const hasMismatch =
+    runtime.setupMismatch ||
+    (typeof runtime.detectedPills === 'number' && runtime.detectedPills !== expected) ||
+    (typeof runtime.currentPills === 'number' && runtime.currentPills !== expected) ||
+    (typeof runtime.totalPills === 'number' && runtime.totalPills !== expected);
+  if (hasMismatch) {
+    return NextResponse.json(
+      {
+        error: `Pill count mismatch. Expected ${expected}, detected ${runtime.detectedPills ?? '-'}, current ${runtime.currentPills ?? '-'}, total ${runtime.totalPills ?? '-'}.`,
+      },
+      { status: 409 },
+    );
+  }
+
   const schedule = await prisma.pillSchedule.create({
     data: {
       deviceId: body.deviceId,
@@ -90,22 +113,6 @@ export async function POST(req: NextRequest) {
   if (dosesToCreate.length > 0) {
     await prisma.deviceDose.createMany({
       data: dosesToCreate,
-    });
-  }
-
-  // Update device total pills
-  if (body.totalPills > 0) {
-    await prisma.deviceRuntimeStatus.upsert({
-      where: { deviceId: body.deviceId },
-      update: { totalPills: body.totalPills, currentPills: body.totalPills },
-      create: { 
-        deviceId: body.deviceId, 
-        hardwareId: device.hardwareId,
-        wifiConnected: false,
-        totalPills: body.totalPills,
-        currentPills: body.totalPills,
-        setupDone: true
-      }
     });
   }
 
