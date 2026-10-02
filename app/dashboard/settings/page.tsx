@@ -32,9 +32,9 @@ export default function SettingsPage() {
       id: 'device',
       icon: Wifi,
       title: 'Device & Connectivity',
-      desc: 'Manage WebSocket and device polling settings.',
+      desc: 'Manage WebSocket and device connectivity settings.',
       items: [
-        { label: 'Real-time updates', desc: 'ESP32 connects via WebSocket (port 8080)', enabled: true },
+        { label: 'Real-time updates', desc: 'ESP32 connects via WebSocket (port 8070)', enabled: true },
         { label: 'Auto-reconnect', desc: 'Device tries to reconnect every 5 seconds', enabled: true },
       ],
     },
