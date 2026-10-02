@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include "HX711.h"
 
 #define DATA_PIN               5
@@ -7,29 +8,36 @@
 #define BUZZER_PIN             18
 #define LED_PIN                19
 
-#define PILL_CHANGE_THRESHOLD  0.3
+#define PILL_CHANGE_THRESHOLD  0.6
 #define CONFIRM_READS          5
 #define CAL_ROUNDS             7
 
 // ----- Wi-Fi + backend config -----
-const char* WIFI_SSID = "SarvehS22";
-const char* WIFI_PASSWORD = "12345678";
-const char* SERVER_BASE_URL = "https://dimple-depositional-sniffily.ngrok-free.dev";
+const char* WIFI_SSID = "OnePlus Nord 4";
+const char* WIFI_PASSWORD = "harsh2004";
+const char* SERVER_BASE_URL = "https://2013-136-233-9-106.ngrok-free.app ";
+const char* WS_HOST = "3f1e-136-233-9-106.ngrok-free.app";
+const uint16_t WS_PORT = 443;
+const char* WS_PATH = "/";
 const char* HARDWARE_ID = "esp32-pillbox-001";
 const char* DEVICE_SECRET = "esp32-secret-001";
 
-const unsigned long POLL_INTERVAL_MS = 4000;
+const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long STATUS_INTERVAL_MS = 10000;
 const unsigned long MONITOR_WARMUP_MS = 1500;
 const unsigned long OVERDOSE_BUZZ_MS = 5000;
 
-unsigned long lastPollMs = 0;
 unsigned long lastStatusMs = 0;
 unsigned long setupAppliedAtMs = 0;
+unsigned long lastWsConnectAttemptMs = 0;
 
 HX711 scale;
+WebSocketsClient wsClient;
+bool wsAuthenticated = false;
 
 float pillWeight = 0;
+float calibrationFactor = 1.0f;
+bool calibrationFactorKnown = false;
 int totalPills = 0;
 int currentPills = 0;
 bool setupDone = false;
@@ -38,6 +46,11 @@ bool setupMismatch = false;
 int detectedPills = 0;
 int pendingCount = -1;
 int confirmStreak = 0;
+
+// ----- Calibration state machine -----
+enum CalState { CAL_IDLE, CAL_WAIT_CLEAR, CAL_WAIT_PILL, CAL_SAMPLING };
+CalState calState = CAL_IDLE;
+unsigned long calStateEnterMs = 0;
 
 bool reminderActive = false;
 String activeDoseId = "";
@@ -110,6 +123,31 @@ bool postJson(String path, String body, int& statusCode, String& responseBody) {
   return statusCode > 0;
 }
 
+void sendWsAuth() {
+  String payload = "{\"type\":\"AUTH\",\"hardwareId\":\"" + String(HARDWARE_ID) +
+                   "\",\"deviceSecret\":\"" + String(DEVICE_SECRET) + "\"}";
+  wsClient.sendTXT(payload);
+  Serial.println("[WS] AUTH sent");
+}
+
+void connectWebSocket() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (wsClient.isConnected()) return;
+
+  unsigned long now = millis();
+  if (now - lastWsConnectAttemptMs < WS_RECONNECT_INTERVAL_MS) return;
+  lastWsConnectAttemptMs = now;
+
+  Serial.print("[WS] connecting wss://");
+  Serial.print(WS_HOST);
+  Serial.print(":");
+  Serial.print(WS_PORT);
+  Serial.print(WS_PATH);
+  Serial.println();
+
+  wsClient.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+}
+
 void registerDeviceWithServer() {
   int code = 0;
   String res = "";
@@ -153,6 +191,23 @@ int getFastPillCount() {
   if (count < 0) count = 0;
   if (count > totalPills) count = totalPills;
   return count;
+}
+
+float getStablePillUnits() {
+  const int VROUNDS = 5;
+  float readings[VROUNDS];
+  for (int i = 0; i < VROUNDS; i++) {
+    float units = getFastWeight() / pillWeight;
+    readings[i] = units < 0 ? -units : units;
+    if (i < VROUNDS - 1) delay(120);
+  }
+  for (int i = 1; i < VROUNDS; i++) {
+    float key = readings[i];
+    int j = i - 1;
+    while (j >= 0 && readings[j] > key) { readings[j + 1] = readings[j]; j--; }
+    readings[j + 1] = key;
+  }
+  return readings[VROUNDS / 2];
 }
 
 
@@ -211,21 +266,27 @@ void buzzContinuous(unsigned long ms) {
   digitalWrite(BUZZER_PIN, LOW);
 }
 
+void postCalStatus(String step, String detailsJson = "") {
+  if (!wsClient.isConnected() || !wsAuthenticated) return;
+  String payload = "{\"type\":\"CAL_STATUS\",\"step\":\"" + step + "\"";
+  if (detailsJson.length() > 0) {
+    payload += "," + detailsJson;
+  }
+  payload += "}";
+  wsClient.sendTXT(payload);
+  Serial.print("[CAL] status sent step="); Serial.println(step);
+}
+
+
 void postDeviceEvent(String type, String payloadJsonObject) {
-  int code = 0;
-  String res = "";
-  String payload = "{\"hardwareId\":\"" + String(HARDWARE_ID) +
-                   "\",\"deviceSecret\":\"" + String(DEVICE_SECRET) +
-                   "\",\"type\":\"" + type + "\"" +
-                   ",\"payload\":" + payloadJsonObject +
-                   "}";
-  bool ok = postJson("/api/device/events", payload, code, res);
-  if (!ok) {
-    Serial.println("[EVENT] post failed");
+  if (!wsClient.isConnected() || !wsAuthenticated) {
+    Serial.println("[EVENT] ws not ready, event skipped");
     return;
   }
-  Serial.print("[EVENT] post status=");
-  Serial.println(code);
+
+  String payload = "{\"type\":\"DOSE_EVENT\",\"event\":\"" + type + "\",\"payload\":" + payloadJsonObject + "}";
+  wsClient.sendTXT(payload);
+  Serial.println("[EVENT] sent over ws");
 }
 
 void startDoseReminder(String json) {
@@ -254,50 +315,87 @@ void startDoseReminder(String json) {
   Serial.println(activeRequiredPills);
 }
 
+// Called from handleCommands — just kicks off the state machine, returns immediately.
 void calibrateOnePillAsUnit() {
-  Serial.println("[CAL] CALIBRATE_ONE_PILL started. Keep exactly one pill on scale.");
+  Serial.println("[CAL] CALIBRATE_ONE_PILL requested — starting state machine.");
+  calState = CAL_WAIT_CLEAR;
+  calStateEnterMs = millis();
+  postCalStatus("CLEAR_BOX");
+  beep(1);
+}
 
-  const int ROUNDS = CAL_ROUNDS;
-  long samples[CAL_ROUNDS];
-  for (int i = 0; i < ROUNDS; i++) {
-    long raw = scale.get_value(30);
-    samples[i] = raw < 0 ? -raw : raw;
-    Serial.print("[CAL] round "); Serial.print(i+1);
-    Serial.print(" raw="); Serial.println(samples[i]);
-    if (i < ROUNDS - 1) delay(300);
-  }
+// Called every loop() iteration — advances calibration without blocking.
+void tickCalibration() {
+  if (calState == CAL_IDLE) return;
 
-  // insertion sort
-  for (int i = 1; i < ROUNDS; i++) {
-    long key = samples[i]; int j = i - 1;
-    while (j >= 0 && samples[j] > key) { samples[j+1] = samples[j]; j--; }
-    samples[j+1] = key;
-  }
+  unsigned long elapsed = millis() - calStateEnterMs;
 
-  // reject lowest and highest, average the middle 5
-  long sum = 0;
-  for (int i = 1; i < ROUNDS - 1; i++) sum += samples[i];
-  long rawOnePill = sum / (ROUNDS - 2);
-
-  Serial.print("[CAL] median-trimmed raw="); Serial.println(rawOnePill);
-
-  if (rawOnePill < 200) {
-    Serial.print("[CAL] failed, raw too small: "); Serial.println(rawOnePill);
+  if (calState == CAL_WAIT_CLEAR) {
+    if (elapsed < 10000) return;  // wait 10s for user to clear scale
+    scale.tare(10);
+    Serial.println("[CAL] tare done");
+    calState = CAL_WAIT_PILL;
+    calStateEnterMs = millis();
+    postCalStatus("PLACE_PILL");
+    beep(2);
     return;
   }
 
-  float calibrationFactor = (float)rawOnePill / 1.0f;
-  scale.set_scale(calibrationFactor);
-  pillWeight = 1.0f;
-  pillUnitMode = true;
-  if (totalPills > 0 && currentPills <= 0) currentPills = totalPills;
-  pendingCount = currentPills;
-  setupDone = totalPills > 0;
+  if (calState == CAL_WAIT_PILL) {
+    if (elapsed < 8000) return;  // wait 8s for user to place 1 pill
+    calState = CAL_SAMPLING;
+    calStateEnterMs = millis();
+    return;
+  }
 
-  Serial.print("[CAL] success. factor="); Serial.print(calibrationFactor, 3);
-  Serial.print(" | pillWeight="); Serial.print(pillWeight, 3);
-  Serial.print(" | setupDone="); Serial.println(setupDone ? "true" : "false");
-  beep(2);
+  if (calState == CAL_SAMPLING) {
+    // Sample with insertion sort
+    const int ROUNDS = CAL_ROUNDS;
+    long samples[CAL_ROUNDS];
+    for (int i = 0; i < ROUNDS; i++) {
+      long raw = scale.get_value(30);
+      samples[i] = raw < 0 ? -raw : raw;
+      Serial.print("[CAL] round "); Serial.print(i+1);
+      Serial.print(" raw="); Serial.println(samples[i]);
+      if (i < ROUNDS - 1) delay(300);
+    }
+
+    // insertion sort
+    for (int i = 1; i < ROUNDS; i++) {
+      long key = samples[i]; int j = i - 1;
+      while (j >= 0 && samples[j] > key) { samples[j+1] = samples[j]; j--; }
+      samples[j+1] = key;
+    }
+
+    // reject lowest and highest, average the middle 5
+    long sum = 0;
+    for (int i = 1; i < ROUNDS - 1; i++) sum += samples[i];
+    long rawOnePill = sum / (ROUNDS - 2);
+
+    Serial.print("[CAL] median-trimmed raw="); Serial.println(rawOnePill);
+    calState = CAL_IDLE;
+
+    if (rawOnePill < 200) {
+      Serial.print("[CAL] failed, raw too small: "); Serial.println(rawOnePill);
+      postCalStatus("FAILED");
+      return;
+    }
+
+    calibrationFactor = (float)rawOnePill / 1.0f;
+    calibrationFactorKnown = true;
+    scale.set_scale(calibrationFactor);
+    pillWeight = 1.0f;
+    pillUnitMode = true;
+    if (totalPills > 0 && currentPills <= 0) currentPills = totalPills;
+    pendingCount = currentPills;
+    setupDone = totalPills > 0;
+
+    Serial.print("[CAL] success. factor="); Serial.print(calibrationFactor, 3);
+    Serial.print(" | pillWeight="); Serial.print(pillWeight, 3);
+    Serial.print(" | setupDone="); Serial.println(setupDone ? "true" : "false");
+    postCalStatus("DONE");
+    beep(2);
+  }
 }
 
 int getStablePillCount() {
@@ -351,8 +449,54 @@ void applySetupFromPayload(String json) {
     Serial.print(detectedPills);
     Serial.print(" expected=");
     Serial.println(currentPills);
+    postCalStatus(
+      "COUNT_MISMATCH",
+      "\"expected\":" + String(currentPills) +
+      ",\"detected\":" + String(detectedPills) +
+      ",\"current\":" + String(currentPills) +
+      ",\"total\":" + String(totalPills) +
+      ",\"message\":\"Mismatch after loading pills\""
+    );
   } else {
     Serial.println("[SETUP] count verified OK");
+
+    if (calibrationFactorKnown && currentPills > 0) {
+      float measuredUnits = getStablePillUnits();
+      float ratio = measuredUnits / (float)currentPills;
+      float delta = ratio - 1.0f;
+
+      if (ratio > 0.75f && ratio < 1.25f && (delta > 0.03f || delta < -0.03f)) {
+        float nextFactor = calibrationFactor * ratio;
+        Serial.print("[CAL] auto-trim factor ");
+        Serial.print(calibrationFactor, 3);
+        Serial.print(" -> ");
+        Serial.print(nextFactor, 3);
+        Serial.print(" (measuredUnits=");
+        Serial.print(measuredUnits, 2);
+        Serial.print(" expected=");
+        Serial.print(currentPills);
+        Serial.println(")");
+
+        calibrationFactor = nextFactor;
+        scale.set_scale(calibrationFactor);
+        delay(300);
+
+        detectedPills = getStablePillCount();
+        setupMismatch = (detectedPills != currentPills);
+        if (setupMismatch) {
+          Serial.println("[CAL] auto-trim produced mismatch, keeping setupMismatch=true");
+        }
+      }
+    }
+
+    postCalStatus(
+      "COUNT_VERIFIED",
+      "\"expected\":" + String(currentPills) +
+      ",\"detected\":" + String(detectedPills) +
+      ",\"current\":" + String(currentPills) +
+      ",\"total\":" + String(totalPills) +
+      ",\"message\":\"Count verified proceed\""
+    );
   }
 
   Serial.print("[SETUP] applied pillWeight=");
@@ -396,6 +540,8 @@ void handleCommands(String json) {
     totalPills = 0;
     currentPills = 0;
     pillWeight = 0;
+    calibrationFactor = 1.0f;
+    calibrationFactorKnown = false;
     reminderActive = false;
     activeDoseId = "";
     activePillName = "";
@@ -406,39 +552,72 @@ void handleCommands(String json) {
   }
 }
 
-void pollServerCommands() {
-  int code = 0;
-  String res = "";
-  String payload = "{\"hardwareId\":\"" + String(HARDWARE_ID) +
-                   "\",\"deviceSecret\":\"" + String(DEVICE_SECRET) + "\"}";
+void handleWebSocketMessage(String json) {
+  Serial.print("[WS] msg: ");
+  Serial.println(json);
 
-  bool ok = postJson("/api/device/poll", payload, code, res);
-  if (!ok) {
-    Serial.println("[POLL] request failed");
-    return;
-  }
-  if (code != 200) {
-    Serial.print("[POLL] status=");
-    Serial.println(code);
+  if (json.indexOf("\"type\":\"AUTH_OK\"") >= 0) {
+    wsAuthenticated = true;
+    Serial.println("[WS] AUTH_OK");
     return;
   }
 
-  if (res.indexOf("\"commands\":[]") >= 0) {
-    Serial.println("[POLL] no commands");
+  if (json.indexOf("\"type\":\"COMMAND\"") >= 0) {
+    Serial.println("[WS] command received");
+    handleCommands(json);
     return;
   }
 
-  Serial.println("[POLL] commands received");
-  handleCommands(res);
+  if (json.indexOf("\"type\":\"COMMANDS\"") >= 0) {
+    Serial.println("[WS] commands received");
+    handleCommands(json);
+    return;
+  }
+
+  if (json.indexOf("\"type\":\"ERROR\"") >= 0) {
+    Serial.print("[WS] server error: ");
+    Serial.println(json);
+  }
+}
+
+void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      wsAuthenticated = false;
+      Serial.println("[WS] disconnected");
+      break;
+    case WStype_CONNECTED:
+      wsAuthenticated = false;
+      Serial.println("[WS] connected");
+      sendWsAuth();
+      break;
+    case WStype_TEXT:
+      {
+        String msg = "";
+        msg.reserve(length + 1);
+        for (size_t i = 0; i < length; i++) {
+          msg += (char)payload[i];
+        }
+        handleWebSocketMessage(msg);
+      }
+      break;
+    case WStype_ERROR:
+      wsAuthenticated = false;
+      Serial.println("[WS] error");
+      break;
+    default:
+      break;
+  }
 }
 
 void pushRuntimeStatus() {
-  int code = 0;
-  String res = "";
+  if (!wsClient.isConnected() || !wsAuthenticated) {
+    Serial.println("[STATUS] ws not ready");
+    return;
+  }
 
-  String payload = "{\"hardwareId\":\"" + String(HARDWARE_ID) +
-                   "\",\"deviceSecret\":\"" + String(DEVICE_SECRET) +
-                   "\",\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
+  String payload = String("{\"type\":\"STATUS\"") +
+                   ",\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
                    ",\"ip\":\"" + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "-") + "\"" +
                    ",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -999) +
                    ",\"setupDone\":" + String(setupDone ? "true" : "false") +
@@ -451,14 +630,8 @@ void pushRuntimeStatus() {
                    ",\"currentPills\":" + String(currentPills) +
                    ",\"totalPills\":" + String(totalPills) +
                    "}";
-
-  bool ok = postJson("/api/device/status", payload, code, res);
-  if (!ok) {
-    Serial.println("[STATUS] push failed");
-    return;
-  }
-  Serial.print("[STATUS] push status=");
-  Serial.println(code);
+  wsClient.sendTXT(payload);
+  Serial.println("[STATUS] sent over ws");
 }
 
 void monitorPills() {
@@ -550,13 +723,18 @@ void setup() {
   Serial.println("===== ESP32 BOOT =====");
   Serial.print("[CFG] HARDWARE_ID: "); Serial.println(HARDWARE_ID);
   Serial.print("[CFG] SERVER_BASE_URL: "); Serial.println(SERVER_BASE_URL);
+  Serial.print("[CFG] WS_HOST: "); Serial.println(WS_HOST);
   Serial.print("[CFG] WIFI_SSID: "); Serial.println(WIFI_SSID);
-  Serial.println("[BOOT] Wi-Fi first + UI-driven setup mode");
+  Serial.println("[BOOT] Wi-Fi + WebSocket mode");
+
+  wsClient.onEvent(onWebSocketEvent);
+  wsClient.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
+  wsClient.enableHeartbeat(15000, 3000, 2);
 
   connectWifi();
   if (WiFi.status() == WL_CONNECTED) {
     registerDeviceWithServer();
-    pushRuntimeStatus();
+    connectWebSocket();
   }
 
 }
@@ -564,15 +742,16 @@ void setup() {
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWifi();
+    wsAuthenticated = false;
   }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    connectWebSocket();
+  }
+
+  wsClient.loop();
 
   unsigned long now = millis();
-
-  if (WiFi.status() == WL_CONNECTED && now - lastPollMs >= POLL_INTERVAL_MS) {
-    lastPollMs = now;
-    pollServerCommands();
-  }
-
   if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
     lastStatusMs = now;
     pushRuntimeStatus();
@@ -588,6 +767,7 @@ void loop() {
     Serial.println(totalPills);
   }
 
-  monitorPills();
+  tickCalibration();
+  if (calState == CAL_IDLE) monitorPills();
   delay(100);
 }

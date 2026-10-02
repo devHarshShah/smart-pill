@@ -393,13 +393,41 @@ export async function enqueueCommand(input: {
     return { error: 'Device does not belong to user' as const };
   }
 
-  const command = await prisma.deviceCommand.create({
-    data: {
-      deviceId: input.deviceId,
-      userId: input.userId,
-      command: input.command,
-      payload: (input.payload as Prisma.InputJsonValue | undefined) ?? Prisma.JsonNull,
-    },
+  const normalized = input.command.trim().toUpperCase();
+  const setupCommands = ['CALIBRATE_ONE_PILL', 'SET_CALIBRATION', 'RESET_SETUP'] as const;
+
+  const command = await prisma.$transaction(async (tx) => {
+    if (normalized === 'CALIBRATE_ONE_PILL' || normalized === 'RESET_SETUP') {
+      await tx.deviceCommand.deleteMany({
+        where: {
+          deviceId: input.deviceId,
+          command: { in: [...setupCommands] },
+        },
+      });
+
+      await tx.deviceEvent.deleteMany({
+        where: {
+          deviceId: input.deviceId,
+          type: 'CAL_STATUS',
+        },
+      });
+    } else if (normalized === 'SET_CALIBRATION') {
+      await tx.deviceCommand.deleteMany({
+        where: {
+          deviceId: input.deviceId,
+          command: 'SET_CALIBRATION',
+        },
+      });
+    }
+
+    return tx.deviceCommand.create({
+      data: {
+        deviceId: input.deviceId,
+        userId: input.userId,
+        command: normalized,
+        payload: (input.payload as Prisma.InputJsonValue | undefined) ?? Prisma.JsonNull,
+      },
+    });
   });
 
   return {

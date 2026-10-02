@@ -1,0 +1,10 @@
+version: "3"
+agent:
+  authtoken: 2mBbicu3RHg0XWEgpZ6tfvuVs21_6QWE6M1wFmzsGP932Zn3d
+tunnels:
+  medilink-app:
+    proto: http
+    addr: 3000
+  medilink-ws:
+    proto: http
+    addr: 8070

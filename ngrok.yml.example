@@ -1,0 +1,10 @@
+version: "3"
+agent:
+  authtoken: YOUR_NGROK_AUTHTOKEN
+tunnels:
+  medilink-app:
+    proto: http
+    addr: 3000
+  medilink-ws:
+    proto: http
+    addr: 8070
