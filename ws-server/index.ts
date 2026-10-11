@@ -30,20 +30,64 @@ interface DeviceClient extends WebSocket {
 
 const clients = new Map<string, DeviceClient>(); // hardwareId -> WebSocket
 
+async function authenticateOrProvisionDevice(hardwareId: string, deviceSecret: string) {
+  const existing = await prisma.device.findUnique({ where: { hardwareId } });
+  if (existing) {
+    if (existing.deviceSecret !== deviceSecret) {
+      return null;
+    }
+    return existing;
+  }
+
+  try {
+    return await prisma.device.create({
+      data: {
+        hardwareId,
+        deviceSecret,
+      },
+    });
+  } catch (error) {
+    // If two auths race to create the same hardwareId, re-read winner row.
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === 'P2002'
+    ) {
+      const created = await prisma.device.findUnique({ where: { hardwareId } });
+      if (created && created.deviceSecret === deviceSecret) {
+        return created;
+      }
+    }
+    throw error;
+  }
+}
+
+async function ensureDeviceBound(ws: DeviceClient) {
+  if (!ws.hardwareId || !ws.deviceSecret) return null;
+  const device = await authenticateOrProvisionDevice(ws.hardwareId, ws.deviceSecret);
+  if (!device) return null;
+  ws.deviceId = device.id;
+  return device;
+}
+
 async function getAndConsumeDeviceCommands(deviceId: string, ownerUserId: string) {
   return prisma.$transaction(async (tx) => {
     const now = new Date();
+    const firstReminderWindowStart = new Date(now.getTime() - 10 * 60 * 1000);
     const secondReminderThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const runtime = await tx.deviceRuntimeStatus.findUnique({ where: { deviceId } });
+    const setupReady = !!runtime?.setupDone;
 
-    const firstDueDose = await tx.deviceDose.findFirst({
-      where: {
-        deviceId,
-        completedAt: null,
-        alertTriggeredAt: null,
-        scheduledAt: { lte: now },
-      },
-      orderBy: { scheduledAt: 'asc' },
-    });
+    const firstDueDose = setupReady
+      ? await tx.deviceDose.findFirst({
+          where: {
+            deviceId,
+            completedAt: null,
+            alertTriggeredAt: null,
+            scheduledAt: { lte: now, gte: firstReminderWindowStart },
+          },
+          orderBy: { scheduledAt: 'asc' },
+        })
+      : null;
 
     if (firstDueDose) {
       await tx.deviceCommand.create({
@@ -69,7 +113,7 @@ async function getAndConsumeDeviceCommands(deviceId: string, ownerUserId: string
           reminderCount: 1,
         },
       });
-    } else {
+    } else if (setupReady) {
       const secondDueDose = await tx.deviceDose.findFirst({
         where: {
           deviceId,
@@ -107,13 +151,36 @@ async function getAndConsumeDeviceCommands(deviceId: string, ownerUserId: string
       }
     }
 
-    const queued = await tx.deviceCommand.findMany({
+    const queuedRaw = await tx.deviceCommand.findMany({
       where: { deviceId },
       orderBy: { createdAt: 'asc' },
     });
 
-    if (queued.length > 0) {
+    if (queuedRaw.length > 0) {
       await tx.deviceCommand.deleteMany({ where: { deviceId } });
+    }
+
+    const setupCommands = new Set(['RESET_SETUP', 'CALIBRATE_ONE_PILL', 'SET_CALIBRATION']);
+    const nowMs = Date.now();
+    let latestSetup: (typeof queuedRaw)[number] | null = null;
+    const passthrough: (typeof queuedRaw) = [];
+
+    for (const cmd of queuedRaw) {
+      if (setupCommands.has(cmd.command)) {
+        latestSetup = cmd;
+      } else {
+        passthrough.push(cmd);
+      }
+    }
+
+    const queued = [...passthrough];
+    if (latestSetup) {
+      const ageMs = nowMs - latestSetup.createdAt.getTime();
+      if (ageMs <= 2 * 60 * 1000) {
+        queued.push(latestSetup);
+      } else {
+        console.log(`[WS] dropped stale setup command ${latestSetup.command} (${Math.round(ageMs / 1000)}s old)`);
+      }
     }
 
     return queued;
@@ -170,8 +237,8 @@ wss.on('connection', (ws: DeviceClient) => {
 
       if (msg.type === 'AUTH') {
         const { hardwareId, deviceSecret } = msg;
-        const device = await prisma.device.findUnique({ where: { hardwareId } });
-        if (device && device.deviceSecret === deviceSecret) {
+        const device = await authenticateOrProvisionDevice(hardwareId, deviceSecret);
+        if (device) {
           ws.deviceId = device.id;
           ws.hardwareId = hardwareId;
           ws.deviceSecret = deviceSecret;
@@ -184,7 +251,13 @@ wss.on('connection', (ws: DeviceClient) => {
           ws.close();
         }
       } 
-      else if (msg.type === 'STATUS' && ws.deviceId) {
+      else if (msg.type === 'STATUS' && (ws.deviceId || ws.hardwareId)) {
+        const device = await ensureDeviceBound(ws);
+        if (!device || !ws.deviceId || !ws.hardwareId) {
+          ws.send(JSON.stringify({ type: 'ERROR', message: 'Device context missing for STATUS' }));
+          return;
+        }
+
         await prisma.deviceRuntimeStatus.upsert({
           where: { deviceId: ws.deviceId },
           update: { 

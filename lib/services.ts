@@ -138,6 +138,11 @@ export async function listDevicesForUser(userId: string) {
         orderBy: { scheduledAt: 'asc' },
         take: 5,
       },
+      events: {
+        where: { type: 'ILLEGAL_PILL_REMOVAL' },
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+      },
     },
     orderBy: { createdAt: 'desc' },
   });
@@ -161,15 +166,25 @@ export async function listDevicesForUser(userId: string) {
             updatedAt: device.runtimeStatus.updatedAt,
           }
         : undefined,
-      upcomingDoses: device.doses.map((dose) => ({
-        id: dose.id,
-        pillName: dose.pillName,
-        scheduledAt: dose.scheduledAt,
-        requiredPills: dose.requiredPills,
-        alertTriggeredAt: dose.alertTriggeredAt,
-        lastReminderAt: dose.lastReminderAt,
-        reminderCount: dose.reminderCount,
-      })),
+      upcomingDoses: device.runtimeStatus?.setupDone
+        ? device.doses.map((dose) => ({
+            id: dose.id,
+            pillName: dose.pillName,
+            scheduledAt: dose.scheduledAt,
+            requiredPills: dose.requiredPills,
+            alertTriggeredAt: dose.alertTriggeredAt,
+            lastReminderAt: dose.lastReminderAt,
+            reminderCount: dose.reminderCount,
+          }))
+        : [],
+      latestIllegalEvent: device.events[0]
+        ? {
+            id: device.events[0].id,
+            type: device.events[0].type,
+            payload: device.events[0].payload,
+            createdAt: device.events[0].createdAt,
+          }
+        : undefined,
     })),
   };
 }
@@ -455,17 +470,22 @@ export async function pollDeviceCommands(input: { hardwareId: string; deviceSecr
 
   const commands = await prisma.$transaction(async (tx) => {
     const now = new Date();
+    const firstReminderWindowStart = new Date(now.getTime() - 10 * 60 * 1000);
     const secondReminderThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const runtime = await tx.deviceRuntimeStatus.findUnique({ where: { deviceId: device.id } });
+    const setupReady = !!runtime?.setupDone;
 
-    const firstDueDose = await tx.deviceDose.findFirst({
-      where: {
-        deviceId: device.id,
-        completedAt: null,
-        alertTriggeredAt: null,
-        scheduledAt: { lte: now },
-      },
-      orderBy: { scheduledAt: 'asc' },
-    });
+    const firstDueDose = setupReady
+      ? await tx.deviceDose.findFirst({
+          where: {
+            deviceId: device.id,
+            completedAt: null,
+            alertTriggeredAt: null,
+            scheduledAt: { lte: now, gte: firstReminderWindowStart },
+          },
+          orderBy: { scheduledAt: 'asc' },
+        })
+      : null;
 
     if (firstDueDose) {
       await tx.deviceCommand.create({
@@ -491,17 +511,17 @@ export async function pollDeviceCommands(input: { hardwareId: string; deviceSecr
           reminderCount: 1,
         },
       });
-    } else {
+    } else if (setupReady) {
       const secondDueDose = await tx.deviceDose.findFirst({
-        where: {
-          deviceId: device.id,
-          completedAt: null,
-          alertTriggeredAt: { not: null },
-          reminderCount: 1,
-          lastReminderAt: { lte: secondReminderThreshold },
-        },
-        orderBy: { scheduledAt: 'asc' },
-      });
+          where: {
+            deviceId: device.id,
+            completedAt: null,
+            alertTriggeredAt: { not: null },
+            reminderCount: 1,
+            lastReminderAt: { lte: secondReminderThreshold },
+          },
+          orderBy: { scheduledAt: 'asc' },
+        });
 
       if (secondDueDose) {
         await tx.deviceCommand.create({
@@ -529,13 +549,34 @@ export async function pollDeviceCommands(input: { hardwareId: string; deviceSecr
       }
     }
 
-    const queued = await tx.deviceCommand.findMany({
+    const queuedRaw = await tx.deviceCommand.findMany({
       where: { deviceId: device.id },
       orderBy: { createdAt: 'asc' },
     });
 
-    if (queued.length > 0) {
+    if (queuedRaw.length > 0) {
       await tx.deviceCommand.deleteMany({ where: { deviceId: device.id } });
+    }
+
+    const setupCommands = new Set(['RESET_SETUP', 'CALIBRATE_ONE_PILL', 'SET_CALIBRATION']);
+    const nowMs = Date.now();
+    let latestSetup: (typeof queuedRaw)[number] | null = null;
+    const passthrough: (typeof queuedRaw) = [];
+
+    for (const cmd of queuedRaw) {
+      if (setupCommands.has(cmd.command)) {
+        latestSetup = cmd;
+      } else {
+        passthrough.push(cmd);
+      }
+    }
+
+    const queued = [...passthrough];
+    if (latestSetup) {
+      const ageMs = nowMs - latestSetup.createdAt.getTime();
+      if (ageMs <= 2 * 60 * 1000) {
+        queued.push(latestSetup);
+      }
     }
 
     return queued;

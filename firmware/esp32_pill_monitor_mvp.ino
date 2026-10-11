@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WebSocketsClient.h>
+#include <Preferences.h>
 #include "HX711.h"
 
 #define DATA_PIN               5
@@ -11,12 +12,14 @@
 #define PILL_CHANGE_THRESHOLD  0.6
 #define CONFIRM_READS          5
 #define CAL_ROUNDS             7
+#define CAL_RAW_MIN            300
+#define CAL_RAW_MAX            900
 
 // ----- Wi-Fi + backend config -----
 const char* WIFI_SSID = "OnePlus Nord 4";
 const char* WIFI_PASSWORD = "harsh2004";
-const char* SERVER_BASE_URL = "https://2013-136-233-9-106.ngrok-free.app ";
-const char* WS_HOST = "3f1e-136-233-9-106.ngrok-free.app";
+const char* SERVER_BASE_URL = "https://cffb-136-233-9-105.ngrok-free.app";
+const char* WS_HOST = "9ac3-136-233-9-105.ngrok-free.app";
 const uint16_t WS_PORT = 443;
 const char* WS_PATH = "/";
 const char* HARDWARE_ID = "esp32-pillbox-001";
@@ -26,14 +29,18 @@ const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long STATUS_INTERVAL_MS = 10000;
 const unsigned long MONITOR_WARMUP_MS = 1500;
 const unsigned long OVERDOSE_BUZZ_MS = 5000;
+const unsigned long RESTORE_VALIDATE_DELAY_MS = 3000;
 
 unsigned long lastStatusMs = 0;
 unsigned long setupAppliedAtMs = 0;
 unsigned long lastWsConnectAttemptMs = 0;
+unsigned long bootAtMs = 0;
 
 HX711 scale;
 WebSocketsClient wsClient;
+Preferences prefs;
 bool wsAuthenticated = false;
+bool wsConnectPending = false;
 
 float pillWeight = 0;
 float calibrationFactor = 1.0f;
@@ -46,6 +53,7 @@ bool setupMismatch = false;
 int detectedPills = 0;
 int pendingCount = -1;
 int confirmStreak = 0;
+bool restoredStateValidated = false;
 
 // ----- Calibration state machine -----
 enum CalState { CAL_IDLE, CAL_WAIT_CLEAR, CAL_WAIT_PILL, CAL_SAMPLING };
@@ -57,6 +65,100 @@ String activeDoseId = "";
 String activePillName = "";
 int activeRequiredPills = 1;
 int activeTakenPills = 0;
+
+void saveRuntimeState() {
+  if (!prefs.begin("pillbox", false)) return;
+  prefs.putBool("init", true);
+  prefs.putBool("setupDone", setupDone);
+  prefs.putBool("pillMode", pillUnitMode);
+  prefs.putBool("mismatch", setupMismatch);
+  prefs.putBool("cfKnown", calibrationFactorKnown);
+  prefs.putFloat("pillW", pillWeight);
+  prefs.putFloat("calF", calibrationFactor);
+  prefs.putInt("total", totalPills);
+  prefs.putInt("current", currentPills);
+  prefs.putInt("detected", detectedPills);
+  prefs.end();
+}
+
+void loadRuntimeState() {
+  if (!prefs.begin("pillbox", true)) return;
+  bool hasState = prefs.getBool("init", false);
+  if (!hasState) {
+    prefs.end();
+    Serial.println("[CFG] no saved runtime state");
+    return;
+  }
+
+  setupDone = prefs.getBool("setupDone", false);
+  pillUnitMode = prefs.getBool("pillMode", true);
+  setupMismatch = prefs.getBool("mismatch", false);
+  calibrationFactorKnown = prefs.getBool("cfKnown", false);
+  pillWeight = prefs.getFloat("pillW", 0.0f);
+  calibrationFactor = prefs.getFloat("calF", 1.0f);
+  totalPills = prefs.getInt("total", 0);
+  currentPills = prefs.getInt("current", 0);
+  detectedPills = prefs.getInt("detected", currentPills);
+  prefs.end();
+
+  if (totalPills < 0) totalPills = 0;
+  if (currentPills < 0) currentPills = 0;
+  if (detectedPills < 0) detectedPills = 0;
+  if (totalPills > 0 && currentPills > totalPills) currentPills = totalPills;
+  if (totalPills > 0 && detectedPills > totalPills) detectedPills = totalPills;
+
+  if (setupDone && calibrationFactorKnown && calibrationFactor > 0.0f) {
+    scale.set_scale(calibrationFactor);
+  }
+
+  pendingCount = currentPills;
+  confirmStreak = 0;
+  setupAppliedAtMs = millis();
+  restoredStateValidated = !setupDone;
+
+  Serial.print("[CFG] restored setupDone=");
+  Serial.print(setupDone ? "true" : "false");
+  Serial.print(" current/total=");
+  Serial.print(currentPills);
+  Serial.print("/");
+  Serial.print(totalPills);
+  Serial.print(" pillWeight=");
+  Serial.print(pillWeight, 3);
+  Serial.print(" calFactor=");
+  Serial.println(calibrationFactor, 3);
+}
+
+void validateRestoredSetupState() {
+  if (restoredStateValidated) return;
+  if (!setupDone) {
+    restoredStateValidated = true;
+    return;
+  }
+  if (millis() - bootAtMs < RESTORE_VALIDATE_DELAY_MS) return;
+
+  // If persisted setup says ready but reading is not aligned, force re-setup instead of
+  // treating startup drift as illegal pill removal.
+  int measured = getStablePillCount();
+  detectedPills = measured;
+  if (measured != currentPills) {
+    Serial.print("[BOOT] persisted count mismatch; saved=");
+    Serial.print(currentPills);
+    Serial.print(" measured=");
+    Serial.println(measured);
+
+    setupMismatch = true;
+    setupDone = false;
+    currentPills = measured;
+    pendingCount = measured;
+    confirmStreak = 0;
+    saveRuntimeState();
+  } else {
+    setupMismatch = false;
+    saveRuntimeState();
+    Serial.println("[BOOT] persisted setup validated");
+  }
+  restoredStateValidated = true;
+}
 
 String wifiStateLabel(wl_status_t s) {
   switch (s) {
@@ -133,6 +235,7 @@ void sendWsAuth() {
 void connectWebSocket() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (wsClient.isConnected()) return;
+  if (wsConnectPending) return;
 
   unsigned long now = millis();
   if (now - lastWsConnectAttemptMs < WS_RECONNECT_INTERVAL_MS) return;
@@ -145,6 +248,7 @@ void connectWebSocket() {
   Serial.print(WS_PATH);
   Serial.println();
 
+  wsConnectPending = true;
   wsClient.beginSSL(WS_HOST, WS_PORT, WS_PATH);
 }
 
@@ -181,7 +285,7 @@ float getFastWeight() {
   return s[2];  // median
 }
 
-int getFastPillCount() {
+int getFastPillCount(bool clampToConfiguredTotal = true) {
   if (!setupDone || pillWeight <= 0.0001f) return currentPills;
 
   float weight = getFastWeight();
@@ -189,7 +293,7 @@ int getFastPillCount() {
   Serial.print(" pillWeight="); Serial.println(pillWeight, 3);
   int count = (int)(weight / pillWeight + 0.5f);
   if (count < 0) count = 0;
-  if (count > totalPills) count = totalPills;
+  if (clampToConfiguredTotal && totalPills > 0 && count > totalPills) count = totalPills;
   return count;
 }
 
@@ -375,8 +479,8 @@ void tickCalibration() {
     Serial.print("[CAL] median-trimmed raw="); Serial.println(rawOnePill);
     calState = CAL_IDLE;
 
-    if (rawOnePill < 200) {
-      Serial.print("[CAL] failed, raw too small: "); Serial.println(rawOnePill);
+    if (rawOnePill < CAL_RAW_MIN || rawOnePill > CAL_RAW_MAX) {
+      Serial.print("[CAL] failed, raw out of range: "); Serial.println(rawOnePill);
       postCalStatus("FAILED");
       return;
     }
@@ -386,13 +490,13 @@ void tickCalibration() {
     scale.set_scale(calibrationFactor);
     pillWeight = 1.0f;
     pillUnitMode = true;
-    if (totalPills > 0 && currentPills <= 0) currentPills = totalPills;
     pendingCount = currentPills;
-    setupDone = totalPills > 0;
+    setupDone = false;
 
     Serial.print("[CAL] success. factor="); Serial.print(calibrationFactor, 3);
     Serial.print(" | pillWeight="); Serial.print(pillWeight, 3);
     Serial.print(" | setupDone="); Serial.println(setupDone ? "true" : "false");
+    saveRuntimeState();
     postCalStatus("DONE");
     beep(2);
   }
@@ -402,7 +506,7 @@ int getStablePillCount() {
   const int VROUNDS = 5;
   int counts[VROUNDS];
   for (int i = 0; i < VROUNDS; i++) {
-    counts[i] = getFastPillCount();
+    counts[i] = getFastPillCount(false);
     Serial.print("[VFY] round "); Serial.print(i+1);
     Serial.print(" count="); Serial.println(counts[i]);
     if (i < VROUNDS - 1) delay(200);
@@ -437,7 +541,7 @@ void applySetupFromPayload(String json) {
   currentPills = nextCurrentPills;
   pendingCount = currentPills;
   confirmStreak = 0;
-  setupDone = true;
+  setupDone = false;
   setupAppliedAtMs = millis();
 
   delay(500);  // let scale settle after config
@@ -453,12 +557,16 @@ void applySetupFromPayload(String json) {
       "COUNT_MISMATCH",
       "\"expected\":" + String(currentPills) +
       ",\"detected\":" + String(detectedPills) +
-      ",\"current\":" + String(currentPills) +
+      ",\"current\":" + String(detectedPills) +
       ",\"total\":" + String(totalPills) +
       ",\"message\":\"Mismatch after loading pills\""
     );
+    currentPills = detectedPills;
+    pendingCount = currentPills;
+    setupDone = false;
   } else {
     Serial.println("[SETUP] count verified OK");
+    setupDone = true;
 
     if (calibrationFactorKnown && currentPills > 0) {
       float measuredUnits = getStablePillUnits();
@@ -507,6 +615,7 @@ void applySetupFromPayload(String json) {
   Serial.print(totalPills);
   Serial.print(" currentPills=");
   Serial.println(currentPills);
+  saveRuntimeState();
   beep(2);
 }
 
@@ -549,6 +658,7 @@ void handleCommands(String json) {
     activeTakenPills = 0;
     digitalWrite(LED_PIN, LOW);
     Serial.println("[SETUP] reset");
+    saveRuntimeState();
   }
 }
 
@@ -584,10 +694,12 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
       wsAuthenticated = false;
+      wsConnectPending = false;
       Serial.println("[WS] disconnected");
       break;
     case WStype_CONNECTED:
       wsAuthenticated = false;
+      wsConnectPending = false;
       Serial.println("[WS] connected");
       sendWsAuth();
       break;
@@ -603,6 +715,7 @@ void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       break;
     case WStype_ERROR:
       wsAuthenticated = false;
+      wsConnectPending = false;
       Serial.println("[WS] error");
       break;
     default:
@@ -635,6 +748,8 @@ void pushRuntimeStatus() {
 }
 
 void monitorPills() {
+  if (!wsAuthenticated) return;
+  if (!restoredStateValidated) return;
   if (!setupDone) return;
   if (millis() - setupAppliedAtMs < MONITOR_WARMUP_MS) return;
 
@@ -688,7 +803,13 @@ void monitorPills() {
             activeTakenPills = 0;
           }
         } else {
-          beep(taken);
+          Serial.println("[SEC] Illegal pill removal (outside active reminder)");
+          buzzContinuous(15000);
+          postDeviceEvent("ILLEGAL_PILL_REMOVAL",
+            "{\"pillName\":\"" + activePillName +
+            "\",\"removedPills\":" + String(taken) +
+            ",\"remainingPills\":" + String(newCount) +
+            ",\"scheduled\":false}");
         }
       } else {
         Serial.print("[PILL] added newCount=");
@@ -700,6 +821,7 @@ void monitorPills() {
       setupMismatch = false;
       pendingCount = newCount;
       confirmStreak = 0;
+      saveRuntimeState();
     }
   } else {
     confirmStreak = 0;
@@ -710,6 +832,7 @@ void monitorPills() {
 void setup() {
   Serial.begin(115200);
   delay(800);
+  bootAtMs = millis();
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -719,6 +842,7 @@ void setup() {
   scale.begin(DATA_PIN, CLK_PIN);
   while (!scale.is_ready()) delay(100);
   scale.tare(20);
+  loadRuntimeState();
 
   Serial.println("===== ESP32 BOOT =====");
   Serial.print("[CFG] HARDWARE_ID: "); Serial.println(HARDWARE_ID);
@@ -728,8 +852,9 @@ void setup() {
   Serial.println("[BOOT] Wi-Fi + WebSocket mode");
 
   wsClient.onEvent(onWebSocketEvent);
-  wsClient.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
-  wsClient.enableHeartbeat(15000, 3000, 2);
+  // Use a single reconnect strategy: manual connectWebSocket() loop below.
+  // Auto-reconnect + manual reconnect together can cause connect/disconnect thrashing.
+  wsClient.enableHeartbeat(30000, 5000, 5);
 
   connectWifi();
   if (WiFi.status() == WL_CONNECTED) {
@@ -743,6 +868,7 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWifi();
     wsAuthenticated = false;
+    wsConnectPending = false;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -750,6 +876,7 @@ void loop() {
   }
 
   wsClient.loop();
+  validateRestoredSetupState();
 
   unsigned long now = millis();
   if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
