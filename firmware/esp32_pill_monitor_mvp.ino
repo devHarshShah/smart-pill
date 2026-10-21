@@ -2,6 +2,9 @@
 #include <HTTPClient.h>
 #include <WebSocketsClient.h>
 #include <Preferences.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include "HX711.h"
 
 #define DATA_PIN               5
@@ -30,17 +33,27 @@ const unsigned long STATUS_INTERVAL_MS = 10000;
 const unsigned long MONITOR_WARMUP_MS = 1500;
 const unsigned long OVERDOSE_BUZZ_MS = 5000;
 const unsigned long RESTORE_VALIDATE_DELAY_MS = 3000;
+const unsigned long OLED_REFRESH_MS = 500;
+
+#define OLED_SDA_PIN           21
+#define OLED_SCL_PIN           22
+#define OLED_ADDR              0x3C
+#define OLED_WIDTH             128
+#define OLED_HEIGHT            64
 
 unsigned long lastStatusMs = 0;
 unsigned long setupAppliedAtMs = 0;
 unsigned long lastWsConnectAttemptMs = 0;
 unsigned long bootAtMs = 0;
+unsigned long lastOledRefreshMs = 0;
 
 HX711 scale;
 WebSocketsClient wsClient;
 Preferences prefs;
+Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 bool wsAuthenticated = false;
 bool wsConnectPending = false;
+bool oledReady = false;
 
 float pillWeight = 0;
 float calibrationFactor = 1.0f;
@@ -65,6 +78,78 @@ String activeDoseId = "";
 String activePillName = "";
 int activeRequiredPills = 1;
 int activeTakenPills = 0;
+String lastKnownPillName = "";
+String oledBannerTitle = "";
+String oledBannerDetail = "";
+unsigned long oledBannerUntilMs = 0;
+
+String clipText(String text, int maxChars) {
+  if ((int)text.length() <= maxChars) return text;
+  if (maxChars <= 1) return text.substring(0, 1);
+  return text.substring(0, maxChars - 1) + "~";
+}
+
+void setOledBanner(String title, String detail, unsigned long durationMs) {
+  oledBannerTitle = title;
+  oledBannerDetail = detail;
+  oledBannerUntilMs = millis() + durationMs;
+}
+
+void initOled() {
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  oledReady = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!oledReady) {
+    Serial.println("[OLED] init failed");
+    return;
+  }
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 0);
+  oled.println("MediLink");
+  oled.println("Booting...");
+  oled.display();
+  Serial.println("[OLED] ready");
+}
+
+void renderOled() {
+  if (!oledReady) return;
+
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 0);
+
+  bool showBanner = millis() < oledBannerUntilMs;
+  if (showBanner) {
+    oled.println(clipText(oledBannerTitle, 21));
+    oled.println(clipText(oledBannerDetail, 21));
+    oled.println("");
+  } else {
+    String pill = activePillName;
+    if (pill.length() == 0) pill = lastKnownPillName;
+    if (pill.length() == 0) pill = "No active med";
+    oled.println(clipText("Pill: " + pill, 21));
+    oled.println("");
+  }
+
+  oled.println(clipText("Remaining: " + String(currentPills) + "/" + String(totalPills), 21));
+
+  if (reminderActive) {
+    oled.println(clipText("Reminder: take " + String(activeRequiredPills), 21));
+  } else if (!setupDone) {
+    oled.println("Setup required");
+  } else if (setupMismatch) {
+    oled.println("Count mismatch");
+  } else {
+    oled.println("Monitoring");
+  }
+
+  String net = String(WiFi.status() == WL_CONNECTED ? "WiFi:OK " : "WiFi:-- ");
+  net += String(wsAuthenticated ? "WS:OK" : "WS:--");
+  oled.println(clipText(net, 21));
+  oled.display();
+}
 
 void saveRuntimeState() {
   if (!prefs.begin("pillbox", false)) return;
@@ -403,6 +488,7 @@ void startDoseReminder(String json) {
   if (!sameActiveDose) {
     activeDoseId = nextDoseId;
     activePillName = nextPillName;
+    lastKnownPillName = nextPillName;
     activeRequiredPills = nextRequiredPills;
     activeTakenPills = 0;
   }
@@ -417,6 +503,7 @@ void startDoseReminder(String json) {
   Serial.print(activePillName);
   Serial.print(" requiredPills=");
   Serial.println(activeRequiredPills);
+  setOledBanner("PILL REMINDER", clipText(activePillName + " x" + String(activeRequiredPills), 21), 12000);
 }
 
 // Called from handleCommands — just kicks off the state machine, returns immediately.
@@ -791,6 +878,7 @@ void monitorPills() {
           } else if (activeTakenPills == activeRequiredPills) {
             Serial.println("[REMINDER] dose completed");
             beep(1);
+            setOledBanner("DOSE COMPLETED", clipText(activePillName, 21), 5000);
             digitalWrite(LED_PIN, LOW);
             reminderActive = false;
             postDeviceEvent("DOSE_COMPLETED",
@@ -805,6 +893,7 @@ void monitorPills() {
         } else {
           Serial.println("[SEC] Illegal pill removal (outside active reminder)");
           buzzContinuous(15000);
+          setOledBanner("ILLEGAL REMOVAL", clipText("Removed " + String(taken) + " pills", 21), 15000);
           postDeviceEvent("ILLEGAL_PILL_REMOVAL",
             "{\"pillName\":\"" + activePillName +
             "\",\"removedPills\":" + String(taken) +
@@ -838,6 +927,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   digitalWrite(LED_PIN, LOW);
+  initOled();
 
   scale.begin(DATA_PIN, CLK_PIN);
   while (!scale.is_ready()) delay(100);
@@ -892,6 +982,11 @@ void loop() {
     Serial.print(currentPills);
     Serial.print("/");
     Serial.println(totalPills);
+  }
+
+  if (now - lastOledRefreshMs >= OLED_REFRESH_MS) {
+    lastOledRefreshMs = now;
+    renderOled();
   }
 
   tickCalibration();

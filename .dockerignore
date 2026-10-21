@@ -1,0 +1,13 @@
+.git
+.next
+node_modules
+pnpm-store
+.pnpm-store
+dist
+coverage
+*.log
+.env
+.env.local
+.env.*.local
+firmware
+README.md

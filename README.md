@@ -34,6 +34,33 @@ Local ports:
 - App: `3000`
 - WebSocket server: `8070`
 
+## Run with Docker (Production-style)
+
+1. Set a strong secret in your shell (or `.env`):
+```bash
+export AUTH_SECRET="replace-with-long-random-secret"
+```
+
+2. Build and start all services:
+```bash
+docker compose up -d --build
+```
+
+3. Check status/logs:
+```bash
+docker compose ps
+docker compose logs -f web ws
+```
+
+4. Endpoints:
+- App: `http://localhost:3000`
+- WebSocket server: `ws://localhost:8070` (or `wss` via your reverse proxy / tunnel)
+
+Notes:
+- Services started: `postgres`, `migrate`, `web`, `ws`.
+- `migrate` runs `prisma migrate deploy` once before `web` and `ws` start.
+- DB volume persists in `medilink_pg_data`.
+
 ## Web Flow
 
 1. Landing page: `/`

@@ -17,5 +17,61 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medilink-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://medilink:medilink@postgres:5432/medilink?schema=public
+      AUTH_SECRET: ${AUTH_SECRET:-replace-with-long-random-secret}
+      NODE_ENV: production
+    command: ["/bin/sh", "-lc", "pnpm prisma migrate deploy || pnpm prisma db push"]
+    restart: "no"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medilink-web
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://medilink:medilink@postgres:5432/medilink?schema=public
+      AUTH_SECRET: ${AUTH_SECRET:-replace-with-long-random-secret}
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    command: ["pnpm", "start"]
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  ws:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medilink-ws
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://medilink:medilink@postgres:5432/medilink?schema=public
+      AUTH_SECRET: ${AUTH_SECRET:-replace-with-long-random-secret}
+      NODE_ENV: production
+    command: ["pnpm", "start:ws"]
+    ports:
+      - "8070:8070"
+    restart: unless-stopped
+
 volumes:
   medilink_pg_data:
