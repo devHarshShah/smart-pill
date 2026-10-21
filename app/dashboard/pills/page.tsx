@@ -25,7 +25,9 @@ type DeviceItem = {
 };
 type Schedule = { breakfast?: string; lunch?: string; dinner?: string; morningSnack?: string; afternoonSnack?: string; bedtime?: string };
 
-type FrequencyType = 'daily_once' | 'twice_101' | 'thrice' | 'weekly' | 'custom';
+type FrequencyType = 'daily_once' | 'twice_101' | 'thrice' | 'weekly';
+type FrequencyMode = 'preset' | 'pattern' | 'slots';
+type SlotKey = 'breakfast' | 'morningSnack' | 'lunch' | 'afternoonSnack' | 'dinner' | 'bedtime';
 
 type PillSchedule = {
   id: string;
@@ -55,8 +57,25 @@ const FREQUENCY_OPTIONS: { id: FrequencyType; label: string; desc: string; emoji
   { id: 'twice_101', label: 'Twice Daily (1-0-1)', desc: 'Morning & evening (with meals)', emoji: '💊' },
   { id: 'thrice', label: 'Three Times Daily', desc: 'Breakfast, lunch & dinner', emoji: '3️⃣' },
   { id: 'weekly', label: 'Once a Week', desc: 'Select a day of the week', emoji: '📅' },
-  { id: 'custom', label: 'Custom Times', desc: 'Manually set specific times', emoji: '⚙️' },
 ];
+
+const SLOT_ORDER: SlotKey[] = ['breakfast', 'morningSnack', 'lunch', 'afternoonSnack', 'dinner', 'bedtime'];
+const SLOT_LABELS: Record<SlotKey, string> = {
+  breakfast: 'Breakfast',
+  morningSnack: 'Morning Snack',
+  lunch: 'Lunch',
+  afternoonSnack: 'Evening Snack',
+  dinner: 'Dinner',
+  bedtime: 'Bedtime',
+};
+const SLOT_DEFAULTS: Record<SlotKey, string> = {
+  breakfast: '08:00',
+  morningSnack: '10:30',
+  lunch: '13:30',
+  afternoonSnack: '16:00',
+  dinner: '20:00',
+  bedtime: '22:00',
+};
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -67,7 +86,7 @@ function addMins(timeStr: string, mins: number): string {
   return `${String(Math.floor(total / 60) % 24).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
 }
 
-function deriveTimes(freq: FrequencyType, schedule: Schedule, weekDay: number, customTimes: string[]): string[] {
+function derivePresetTimes(freq: FrequencyType, schedule: Schedule): string[] {
   const buf = 15;
   switch (freq) {
     case 'daily_once':
@@ -82,9 +101,55 @@ function deriveTimes(freq: FrequencyType, schedule: Schedule, weekDay: number, c
       ];
     case 'weekly':
       return [addMins(schedule.breakfast ?? '08:00', buf)];
-    case 'custom':
-      return customTimes.filter(Boolean);
   }
+}
+
+function parseDosePattern(pattern: string): number[] {
+  const parts = pattern
+    .split(/[^0-9]+/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => Number(p));
+
+  if (parts.length === 3) {
+    const [b, l, d] = parts.map((v) => (v > 0 ? 1 : 0));
+    return [b, 0, l, 0, d, 0];
+  }
+  if (parts.length >= 6) {
+    return parts.slice(0, 6).map((v) => (v > 0 ? 1 : 0));
+  }
+  return [1, 0, 0, 0, 1, 0];
+}
+
+function derivePatternTimes(pattern: string, schedule: Schedule): string[] {
+  const buf = 15;
+  const flags = parseDosePattern(pattern);
+  return SLOT_ORDER.flatMap((slot, idx) => {
+    if (!flags[idx]) return [];
+    const base = schedule[slot] ?? SLOT_DEFAULTS[slot];
+    return [addMins(base, buf)];
+  });
+}
+
+function deriveSlotTimes(selectedSlots: SlotKey[], schedule: Schedule): string[] {
+  const buf = 15;
+  return SLOT_ORDER.flatMap((slot) => {
+    if (!selectedSlots.includes(slot)) return [];
+    const base = schedule[slot] ?? SLOT_DEFAULTS[slot];
+    return [addMins(base, buf)];
+  });
+}
+
+function formatFrequencyTypeLabel(type: string): string {
+  const preset = FREQUENCY_OPTIONS.find((f) => f.id === type);
+  if (preset) return preset.label;
+  if (type.startsWith('pattern_')) {
+    return `Pattern ${type.replace(/^pattern_/, '')}`;
+  }
+  if (type.startsWith('slots_')) {
+    return `Slots ${type.replace(/^slots_/, '')}`;
+  }
+  return type;
 }
 
 async function apiFetch<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
@@ -115,9 +180,11 @@ export default function PillsPage() {
   const [selectedDevice, setSelectedDevice] = useState('');
 
   // Step 2
+  const [frequencyMode, setFrequencyMode] = useState<FrequencyMode>('preset');
   const [frequency, setFrequency] = useState<FrequencyType>('twice_101');
   const [weekDay, setWeekDay] = useState(1);
-  const [customTimes, setCustomTimes] = useState(['09:00', '21:00']);
+  const [dosePattern, setDosePattern] = useState('1-0-1-0-0-0');
+  const [selectedSlots, setSelectedSlots] = useState<SlotKey[]>(['breakfast', 'dinner']);
 
   // Step 3
   const [startDate, setStartDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -130,22 +197,28 @@ export default function PillsPage() {
   const [calFlowStartedAt, setCalFlowStartedAt] = useState<number>(0);
   const calPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const derivedTimes = deriveTimes(frequency, schedule, weekDay, customTimes);
+  const derivedTimes =
+    frequencyMode === 'preset'
+      ? derivePresetTimes(frequency, schedule)
+      : frequencyMode === 'pattern'
+        ? derivePatternTimes(dosePattern, schedule)
+        : deriveSlotTimes(selectedSlots, schedule);
 
   // Auto-compute daysCount from totalPills / dosesPerDay
   useEffect(() => {
     const n = Number(totalPills);
     if (!n || !derivedTimes.length) return;
-    const days = frequency === 'weekly'
+    const days = frequencyMode === 'preset' && frequency === 'weekly'
       ? n * 7
       : Math.floor(n / derivedTimes.length);
     setDaysCount(String(days));
-  }, [totalPills, frequency, derivedTimes.length]);
+  }, [totalPills, frequencyMode, frequency, derivedTimes.length]);
 
-  const fetchSchedules = (t: string) =>
-    apiFetch<{ schedules: PillSchedule[] }>('/api/pill-schedules', t)
-      .then((r) => setSchedules(r.schedules ?? []))
-      .catch(() => {});
+  const fetchSchedules = async (t: string) => {
+    const r = await apiFetch<{ schedules: PillSchedule[] }>('/api/pill-schedules', t);
+    setSchedules(r.schedules ?? []);
+    return r.schedules ?? [];
+  };
 
   function stopCalPolling() {
     if (calPollRef.current) {
@@ -253,19 +326,32 @@ export default function PillsPage() {
     setSaving(true);
     setError('');
     try {
-      await apiFetch('/api/pill-schedules', token, {
+      const normalizedPattern = parseDosePattern(dosePattern).join('-');
+      const frequencyTypeForSave =
+        frequencyMode === 'preset'
+          ? frequency
+          : frequencyMode === 'pattern'
+            ? `pattern_${normalizedPattern}`
+            : `slots_${SLOT_ORDER.map((slot) => (selectedSlots.includes(slot) ? 1 : 0)).join('-')}`;
+
+      const createResult = await apiFetch<{ schedule: PillSchedule; dosesCreated: number }>('/api/pill-schedules', token, {
         method: 'POST',
         body: JSON.stringify({
           deviceId: selectedDevice,
           pillName,
           totalPills: Number(totalPills),
-          frequencyType: frequency,
+          frequencyType: frequencyTypeForSave,
           timesOfDay: derivedTimes,
-          daysOfWeek: frequency === 'weekly' ? [weekDay] : [],
+          daysOfWeek: frequencyMode === 'preset' && frequency === 'weekly' ? [weekDay] : [],
           startDate,
           daysCount: Number(daysCount),
         }),
       });
+      try {
+        await fetchSchedules(token);
+      } catch {
+        setSchedules((prev) => [createResult.schedule, ...prev]);
+      }
       closeWizardSuccess();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Error creating schedule');
@@ -329,6 +415,10 @@ export default function PillsPage() {
     setStep(0);
     setPillName('');
     setTotalPills('30');
+    setFrequencyMode('preset');
+    setFrequency('twice_101');
+    setDosePattern('1-0-1-0-0-0');
+    setSelectedSlots(['breakfast', 'dinner']);
     setCalStep('IDLE');
     setVerifyState('IDLE');
     setVerifyMessage('');
@@ -338,7 +428,6 @@ export default function PillsPage() {
   function closeWizardSuccess() {
     setSuccess(`✓ ${pillName} schedule created! Doses generated for ${daysCount} days.`);
     resetWizardState();
-    fetchSchedules(token);
   }
 
   function closeWizardWithoutSave() {
@@ -348,7 +437,13 @@ export default function PillsPage() {
 
   const steps = ['Pill Info', 'Frequency', 'Confirm', 'Load Pills'];
 
-  const dosesPerDay = frequency === 'weekly' ? '1/7' : `${derivedTimes.length}`;
+  const dosesPerDay = frequencyMode === 'preset' && frequency === 'weekly' ? '1/7' : `${derivedTimes.length}`;
+  const frequencySummaryLabel =
+    frequencyMode === 'preset'
+      ? (FREQUENCY_OPTIONS.find((f) => f.id === frequency)?.label ?? frequency)
+      : frequencyMode === 'pattern'
+        ? `Pattern ${parseDosePattern(dosePattern).join('-')}`
+        : `Slots ${SLOT_ORDER.map((slot) => (selectedSlots.includes(slot) ? 1 : 0)).join('-')}`;
 
   return (
     <div className="space-y-6">
@@ -442,54 +537,120 @@ export default function PillsPage() {
             {/* Step 2 – Frequency */}
             {step === 1 && (
               <div className="space-y-4">
-                <div className="grid gap-2">
-                  {FREQUENCY_OPTIONS.map((opt) => (
-                    <button
-                      key={opt.id}
-                      onClick={() => setFrequency(opt.id)}
-                      className={`flex items-center gap-3 rounded-xl border p-4 text-left transition-all ${frequency === opt.id ? 'border-primary/50 bg-primary/10' : 'border-border/50 hover:border-border/80'}`}
-                    >
-                      <span className="text-2xl">{opt.emoji}</span>
-                      <div className="flex-1">
-                        <p className="text-sm font-semibold">{opt.label}</p>
-                        <p className="text-xs text-muted-foreground">{opt.desc}</p>
-                      </div>
-                      {frequency === opt.id && <CheckCircle2 className="h-4 w-4 text-primary shrink-0" />}
-                    </button>
-                  ))}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <Button
+                    type="button"
+                    variant={frequencyMode === 'preset' ? 'default' : 'outline'}
+                    onClick={() => setFrequencyMode('preset')}
+                  >
+                    Presets
+                  </Button>
+                  <Button
+                    type="button"
+                    variant={frequencyMode === 'pattern' ? 'default' : 'outline'}
+                    onClick={() => setFrequencyMode('pattern')}
+                  >
+                    Pattern (1-0-1)
+                  </Button>
+                  <Button
+                    type="button"
+                    variant={frequencyMode === 'slots' ? 'default' : 'outline'}
+                    onClick={() => setFrequencyMode('slots')}
+                  >
+                    Choose Meal Slots
+                  </Button>
                 </div>
 
-                {frequency === 'weekly' && (
-                  <div className="space-y-1.5">
-                    <Label>Day of week</Label>
-                    <div className="flex flex-wrap gap-2">
-                      {DAYS.map((day, i) => (
+                {frequencyMode === 'preset' && (
+                  <div className="space-y-4">
+                    <div className="grid gap-2">
+                      {FREQUENCY_OPTIONS.map((opt) => (
                         <button
-                          key={day}
-                          onClick={() => setWeekDay(i)}
-                          className={`rounded-lg border px-3 py-1.5 text-sm transition-colors ${weekDay === i ? 'border-primary bg-primary/10 text-primary font-medium' : 'border-border/50 text-muted-foreground hover:border-border'}`}
+                          key={opt.id}
+                          onClick={() => setFrequency(opt.id)}
+                          className={`flex items-center gap-3 rounded-xl border p-4 text-left transition-all ${frequency === opt.id ? 'border-primary/50 bg-primary/10' : 'border-border/50 hover:border-border/80'}`}
                         >
-                          {day.slice(0, 3)}
+                          <span className="text-2xl">{opt.emoji}</span>
+                          <div className="flex-1">
+                            <p className="text-sm font-semibold">{opt.label}</p>
+                            <p className="text-xs text-muted-foreground">{opt.desc}</p>
+                          </div>
+                          {frequency === opt.id && <CheckCircle2 className="h-4 w-4 text-primary shrink-0" />}
                         </button>
+                      ))}
+                    </div>
+
+                    {frequency === 'weekly' && (
+                      <div className="space-y-1.5">
+                        <Label>Day of week</Label>
+                        <div className="flex flex-wrap gap-2">
+                          {DAYS.map((day, i) => (
+                            <button
+                              key={day}
+                              onClick={() => setWeekDay(i)}
+                              className={`rounded-lg border px-3 py-1.5 text-sm transition-colors ${weekDay === i ? 'border-primary bg-primary/10 text-primary font-medium' : 'border-border/50 text-muted-foreground hover:border-border'}`}
+                            >
+                              {day.slice(0, 3)}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {frequencyMode === 'pattern' && (
+                  <div className="space-y-2 rounded-xl border border-border/50 p-4">
+                    <Label htmlFor="dosePattern">Dose pattern</Label>
+                    <Input
+                      id="dosePattern"
+                      value={dosePattern}
+                      onChange={(e) => setDosePattern(e.target.value)}
+                      placeholder="e.g. 1-0-1 or 1-0-0-1-0-0"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      3 slots format maps to Breakfast-Lunch-Dinner. 6 slots format maps to Breakfast-MorningSnack-Lunch-EveningSnack-Dinner-Bedtime.
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Current normalized pattern: {parseDosePattern(dosePattern).join('-')}
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1">
+                      {SLOT_ORDER.map((slot) => (
+                        <div key={slot} className="rounded-md border border-border/40 px-2 py-1 text-xs text-muted-foreground">
+                          {SLOT_LABELS[slot]}: {schedule[slot] ?? SLOT_DEFAULTS[slot]}
+                        </div>
                       ))}
                     </div>
                   </div>
                 )}
 
-                {frequency === 'custom' && (
-                  <div className="space-y-2">
-                    <Label>Custom times</Label>
-                    {customTimes.map((t, i) => (
-                      <div key={i} className="flex items-center gap-2">
-                        <Input type="time" value={t} onChange={(e) => setCustomTimes((prev) => prev.map((v, j) => j === i ? e.target.value : v))} className="w-32" />
-                        {customTimes.length > 1 && (
-                          <Button variant="ghost" size="sm" onClick={() => setCustomTimes((prev) => prev.filter((_, j) => j !== i))}>Remove</Button>
-                        )}
-                      </div>
-                    ))}
-                    {customTimes.length < 4 && (
-                      <Button variant="outline" size="sm" onClick={() => setCustomTimes((prev) => [...prev, '09:00'])}>+ Add time</Button>
-                    )}
+                {frequencyMode === 'slots' && (
+                  <div className="space-y-3 rounded-xl border border-border/50 p-4">
+                    <p className="text-sm font-medium">Select preferred intake slots</p>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {SLOT_ORDER.map((slot) => {
+                        const active = selectedSlots.includes(slot);
+                        const slotTime = schedule[slot] ?? SLOT_DEFAULTS[slot];
+                        return (
+                          <button
+                            key={slot}
+                            type="button"
+                            onClick={() => setSelectedSlots((prev) => (
+                              prev.includes(slot)
+                                ? prev.filter((s) => s !== slot)
+                                : [...prev, slot]
+                            ))}
+                            className={`rounded-lg border px-3 py-2 text-left transition-colors ${active ? 'border-primary bg-primary/10 text-primary font-medium' : 'border-border/50 text-muted-foreground hover:border-border'}`}
+                          >
+                            <div className="text-sm">{SLOT_LABELS[slot]}</div>
+                            <div className="text-xs opacity-80">{slotTime}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Internal pattern: {SLOT_ORDER.map((slot) => (selectedSlots.includes(slot) ? 1 : 0)).join('-')}
+                    </p>
                   </div>
                 )}
               </div>
@@ -509,7 +670,7 @@ export default function PillsPage() {
                   </div>
                   <div className="flex items-center gap-2 text-sm text-muted-foreground">
                     <Clock className="h-4 w-4" />
-                    <span>{FREQUENCY_OPTIONS.find((f) => f.id === frequency)?.label}</span>
+                    <span>{frequencySummaryLabel}</span>
                   </div>
                   <div className="flex flex-wrap gap-2">
                     {derivedTimes.map((t) => (
@@ -610,9 +771,12 @@ export default function PillsPage() {
                 )}
 
                 {verifyState === 'MISMATCH' && (
-                  <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
-                    <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
-                    <p className="text-sm text-amber-300">{verifyMessage}</p>
+                  <div className="space-y-3">
+                    <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+                      <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
+                      <p className="text-sm text-amber-300">{verifyMessage}</p>
+                    </div>
+                    <Button variant="outline" onClick={startCalibration}>Recalibrate</Button>
                   </div>
                 )}
 
@@ -629,6 +793,11 @@ export default function PillsPage() {
                       <CheckCircle2 className="h-4 w-4 text-emerald-400 mt-0.5 shrink-0" />
                       <p className="text-sm text-emerald-300">{verifyMessage}</p>
                     </div>
+                    {error && (
+                      <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2">
+                        <p className="text-sm text-destructive">{error}</p>
+                      </div>
+                    )}
                     <Button onClick={submitSchedule} className="gap-2" disabled={saving}>
                       {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
                       Create Schedule
@@ -692,7 +861,7 @@ export default function PillsPage() {
                     <div className="flex-1 min-w-0">
                       <p className="font-medium text-sm">{s.pillName}</p>
                       <p className="text-xs text-muted-foreground">
-                        {FREQUENCY_OPTIONS.find((f) => f.id === s.frequencyType)?.label ?? s.frequencyType}
+                        {formatFrequencyTypeLabel(s.frequencyType)}
                         {' · '}
                         {devices.find((d) => d.id === s.deviceId)?.label ?? s.deviceId}
                       </p>
