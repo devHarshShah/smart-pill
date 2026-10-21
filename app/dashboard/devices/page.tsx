@@ -22,6 +22,17 @@ type DeviceItem = {
   id: string; hardwareId: string; label?: string; pairedAt?: string;
   status?: DeviceStatus;
   upcomingDoses?: Array<{ id: string; pillName: string; scheduledAt: string; requiredPills: number; alertTriggeredAt?: string | null }>;
+  latestIllegalEvent?: DeviceEventItem;
+};
+type DeviceEventItem = {
+  id: string;
+  type: string;
+  payload?: {
+    removedPills?: number;
+    remainingPills?: number;
+    scheduled?: boolean;
+  };
+  createdAt: string;
 };
 
 function isOnline(updatedAt?: string) {
@@ -55,7 +66,17 @@ function PillBar({ current, total }: { current: number; total: number }) {
   );
 }
 
-function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: string; onRefresh: () => void }) {
+function DeviceCard({
+  device,
+  token,
+  onRefresh,
+  latestIllegalEvent,
+}: {
+  device: DeviceItem;
+  token: string;
+  onRefresh: () => void;
+  latestIllegalEvent?: DeviceEventItem;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [totalPills, setTotalPills] = useState('15');
   const [currentPills, setCurrentPills] = useState('15');
@@ -179,6 +200,17 @@ function DeviceCard({ device, token, onRefresh }: { device: DeviceItem; token: s
             ))}
           </div>
         )}
+
+        {latestIllegalEvent && (
+          <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2">
+            <p className="text-xs font-semibold text-destructive">Illegal pill removal detected</p>
+            <p className="text-xs text-destructive/90">
+              {new Date(latestIllegalEvent.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {' · '}
+              Removed {latestIllegalEvent.payload?.removedPills ?? '?'} pill(s), remaining {latestIllegalEvent.payload?.remainingPills ?? '?'}.
+            </p>
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -192,12 +224,23 @@ export default function DevicesPage() {
   const [claimId, setClaimId] = useState('');
   const [claiming, setClaiming] = useState(false);
   const [claimError, setClaimError] = useState('');
+  const seenIllegalRef = useRef<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   async function fetchDevices(t: string) {
     try {
       const result = await apiFetch<{ devices: DeviceItem[] }>('/api/devices', t);
       setDevices(result.devices ?? []);
+      for (const device of result.devices ?? []) {
+        const illegal = device.latestIllegalEvent;
+        const isRecent = illegal ? Date.now() - new Date(illegal.createdAt).getTime() < 2 * 60 * 1000 : false;
+        if (illegal && isRecent && !seenIllegalRef.current.has(illegal.id)) {
+          seenIllegalRef.current.add(illegal.id);
+          toast.error(`Illegal pill removal on ${device.label ?? device.hardwareId}`, {
+            description: `Removed ${illegal.payload?.removedPills ?? '?'} pill(s).`,
+          });
+        }
+      }
       setError('');
     } catch (e) { setError(e instanceof Error ? e.message : 'Failed to load'); }
   }
@@ -252,7 +295,15 @@ export default function DevicesPage() {
         </Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          {devices.map(d => <DeviceCard key={d.id} device={d} token={token} onRefresh={() => fetchDevices(token)} />)}
+          {devices.map(d => (
+            <DeviceCard
+              key={d.id}
+              device={d}
+              token={token}
+              onRefresh={() => fetchDevices(token)}
+              latestIllegalEvent={d.latestIllegalEvent}
+            />
+          ))}
         </div>
       )}
 

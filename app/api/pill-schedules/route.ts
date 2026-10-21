@@ -71,6 +71,16 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const startParts = body.startDate.split('-').map(Number);
+  if (startParts.length !== 3 || startParts.some((n) => !Number.isFinite(n))) {
+    return NextResponse.json({ error: 'Invalid startDate' }, { status: 400 });
+  }
+  const [year, month, day] = startParts;
+  const startLocal = new Date(year, month - 1, day, 0, 0, 0, 0);
+  if (Number.isNaN(startLocal.getTime())) {
+    return NextResponse.json({ error: 'Invalid startDate' }, { status: 400 });
+  }
+
   const schedule = await prisma.pillSchedule.create({
     data: {
       deviceId: body.deviceId,
@@ -78,14 +88,14 @@ export async function POST(req: NextRequest) {
       frequencyType: body.frequencyType,
       timesOfDay: body.timesOfDay,
       daysOfWeek: body.daysOfWeek,
-      startDate: new Date(body.startDate),
+      startDate: startLocal,
     },
   });
 
   // Generate doses
   const dosesToCreate = [];
-  const start = new Date(body.startDate);
-  start.setHours(0, 0, 0, 0);
+  const now = new Date();
+  const start = new Date(startLocal);
 
   for (let i = 0; i < body.daysCount; i++) {
     const curDate = new Date(start);
@@ -98,8 +108,12 @@ export async function POST(req: NextRequest) {
 
     for (const timeStr of body.timesOfDay) {
       const [hh, mm] = timeStr.split(':').map(Number);
+      if (!Number.isFinite(hh) || !Number.isFinite(mm)) continue;
       const doseTime = new Date(curDate);
       doseTime.setHours(hh, mm, 0, 0);
+      if (doseTime <= now) {
+        continue;
+      }
 
       dosesToCreate.push({
         deviceId: body.deviceId,
